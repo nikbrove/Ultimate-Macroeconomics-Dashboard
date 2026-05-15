@@ -197,6 +197,21 @@
             "name": "Real Effective Exchange Rate",
             "id": "PX.REX.REER",
             "db": 2
+        },
+        {
+            "name": "Manufactures exports share",
+            "id": "TX.VAL.MANF.ZS.UN",
+            "db": 2
+        },
+        {
+            "name": "Food exports share",
+            "id": "TX.VAL.FOOD.ZS.UN",
+            "db": 2
+        },
+        {
+            "name": "Fuel exports share",
+            "id": "TX.VAL.FUEL.ZS.UN",
+            "db": 2
         }
     ],
     "Demography": [
@@ -238,6 +253,21 @@
         {
             "name": "Unemployment",
             "id": "SL.UEM.TOTL.ZS",
+            "db": 2
+        },
+        {
+            "name": "Population ages 0-14",
+            "id": "SP.POP.0014.TO.ZS",
+            "db": 2
+        },
+        {
+            "name": "Population ages 15-64",
+            "id": "SP.POP.1564.TO.ZS",
+            "db": 2
+        },
+        {
+            "name": "Population ages 65 and above",
+            "id": "SP.POP.65UP.TO.ZS",
             "db": 2
         }
     ],
@@ -283,6 +313,21 @@
             "name": "Research_Development_GDP",
             "id": "GB.XPD.RSDV.GD.ZS",
             "db": 2
+        },
+        {
+            "name": "Internet users",
+            "id": "IT.NET.USER.ZS",
+            "db": 2
+        },
+        {
+            "name": "Mobile subscriptions",
+            "id": "IT.CEL.SETS.P2",
+            "db": 2
+        },
+        {
+            "name": "Patent applications, residents",
+            "id": "IP.PAT.RESD",
+            "db": 2
         }
     ],
     "Health and wellbeing": [
@@ -300,6 +345,16 @@
             "name": "Life expectancy, female",
             "id": "SP.DYN.LE00.FE.IN",
             "db": 2
+        },
+        {
+            "name": "Under-5 mortality",
+            "id": "SH.DYN.MORT",
+            "db": 2
+        },
+        {
+            "name": "Fertility rate",
+            "id": "SP.DYN.TFRT.IN",
+            "db": 2
         }
     ],
     "Education and Human Capital": [
@@ -312,6 +367,21 @@
             "name": "Researchers_RD",
             "id": "SP.POP.SCIE.RD.P6",
             "db": 2
+        },
+        {
+            "name": "School enrollment, primary",
+            "id": "SE.PRM.ENRR",
+            "db": 2
+        },
+        {
+            "name": "School enrollment, secondary",
+            "id": "SE.SEC.ENRR",
+            "db": 2
+        },
+        {
+            "name": "School enrollment, tertiary",
+            "id": "SE.TER.ENRR",
+            "db": 2
         }
     ],
     "Environment and ecology": [
@@ -323,6 +393,21 @@
         {
             "name": "Renewable Energy Consumption",
             "id": "EG.FEC.RNEW.ZS",
+            "db": 2
+        },
+        {
+            "name": "Greenhouse gas emissions per capita",
+            "id": "EN.GHG.ALL.PC.CE.AR5",
+            "db": 2
+        },
+        {
+            "name": "Greenhouse gas emissions total",
+            "id": "EN.GHG.ALL.MT.CE.AR5",
+            "db": 2
+        },
+        {
+            "name": "Forest area",
+            "id": "AG.LND.FRST.ZS",
             "db": 2
         }
     ]

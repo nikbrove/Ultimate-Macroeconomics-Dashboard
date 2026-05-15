@@ -201,6 +201,106 @@ def _render_economy_structure_section() -> None:
     st.divider()
 
 
+def _build_sector_timeseries(country_code: str | None) -> tuple[pl.DataFrame, str | None]:
+    rows: list[pl.DataFrame] = []
+    for sector_name, indicator_id, _ in ECONOMY_STRUCTURE_INDICATORS:
+        if country_code is None:
+            slice_df = _prepare_indicator_slice(indicator_id, country_code="ALL")
+            if slice_df.is_empty():
+                continue
+            agg_df = slice_df.group_by("year").agg(pl.col("value").mean().alias(sector_name))
+            slice_df = agg_df
+        else:
+            slice_df = _prepare_indicator_slice(indicator_id, country_code=country_code)
+            if slice_df.is_empty():
+                continue
+            slice_df = slice_df.select(["year", pl.col("value").alias(sector_name)])
+
+        rows.append(slice_df)
+
+    if not rows:
+        return pl.DataFrame(), None
+
+    panel = rows[0]
+    for extra in rows[1:]:
+        panel = panel.join(extra, on="year", how="inner")
+
+    panel = panel.sort("year")
+    if panel.is_empty():
+        return pl.DataFrame(), country_code
+    return panel, country_code
+
+
+def _build_sector_area(
+    panel: pl.DataFrame, title: str
+) -> go.Figure:
+    fig = go.Figure()
+    for sector_name, _, color_token in ECONOMY_STRUCTURE_INDICATORS:
+        if sector_name not in panel.columns:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=panel["year"].to_list(),
+                y=panel[sector_name].to_list(),
+                mode="lines",
+                stackgroup="one",
+                name=sector_name,
+                line={"color": get_color(color_token), "width": 0.5},
+                hovertemplate=f"%{{x}}<br>{sector_name}: %{{y:.2f}}% of GDP<extra></extra>",
+            )
+        )
+    fig.update_layout(
+        title=title,
+        xaxis_title="Year",
+        yaxis_title="% of GDP (stacked)",
+        margin={"l": 40, "r": 20, "t": 50, "b": 40},
+    )
+    return apply_plotly_theme(fig)
+
+
+def _render_sector_trajectory_deep_dive() -> None:
+    st.divider()
+    st.subheader("Sector Trajectory (1960 → today)")
+    st.caption(
+        "Stacked-area view of how each economy has rebalanced agriculture, "
+        "manufacturing, and services value-added over time. One small-multiple "
+        "per selected country (up to 4); if no countries are selected the chart "
+        "shows the global cross-country mean."
+    )
+
+    selected_codes = [
+        str(code).strip().upper()
+        for code in st.session_state.get(f"{PAGE_TITLE}_countries", [])
+        if str(code).strip()
+    ][:4]
+    _, label_by_iso, name_by_iso = _build_country_labels()
+
+    if not selected_codes:
+        panel, _ = _build_sector_timeseries(None)
+        if panel.is_empty():
+            st.info("Sector trajectory data is unavailable.")
+            return
+        fig = _build_sector_area(panel, title="Global cross-country mean — sector shares of GDP")
+        st.plotly_chart(fig, width="stretch")
+        st.caption(
+            "Showing the global cross-country mean. Select countries above to "
+            "compare individual trajectories side by side."
+        )
+        return
+
+    columns = st.columns(min(2, len(selected_codes)))
+    for index, code in enumerate(selected_codes):
+        panel, _ = _build_sector_timeseries(code)
+        if panel.is_empty():
+            with columns[index % len(columns)]:
+                st.info(f"No sector data available for {code}.")
+            continue
+        country_name = name_by_iso.get(code, code)
+        with columns[index % len(columns)]:
+            fig = _build_sector_area(panel, title=f"{country_name} ({code})")
+            st.plotly_chart(fig, width="stretch")
+
+
 render_page_from_config(
     page_title=PAGE_TITLE,
     section_keys=["Structure"],
@@ -209,4 +309,5 @@ render_page_from_config(
         "and services as a share of GDP."
     ),
     before_graphs_renderer=_render_economy_structure_section,
+    after_graphs_renderer=_render_sector_trajectory_deep_dive,
 )

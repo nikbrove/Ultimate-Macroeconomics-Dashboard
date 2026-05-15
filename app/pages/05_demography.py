@@ -1,13 +1,21 @@
 import plotly.express as px
+import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
 
 from core.plotting import apply_plotly_theme
+from core.theming import get_color, get_colorway
 from core.postgres_client import (
     get_world_bank_country_mapping,
     get_world_bank_indicator,
 )
 from pages.page_utils import render_page_from_config
+
+
+PAGE_TITLE = "Demography"
+AGE_0_14_INDICATOR_ID = "SP.POP.0014.TO.ZS"
+AGE_15_64_INDICATOR_ID = "SP.POP.1564.TO.ZS"
+AGE_65_INDICATOR_ID = "SP.POP.65UP.TO.ZS"
 
 
 POPULATION_INDICATOR_ID = "SP.POP.TOTL"
@@ -164,12 +172,125 @@ def _render_demography_bubble() -> None:
     st.divider()
 
 
+def _render_age_structure_deep_dive() -> None:
+    st.divider()
+    st.subheader("Age Structure (ternary plot)")
+    st.caption(
+        "Every country plotted on a triangle whose corners are the three age "
+        "shares — Young (0-14), Working (15-64), Elderly (65+). Latest "
+        "available year. Selected countries are highlighted and labelled."
+    )
+
+    young = _prepare_indicator_slice(AGE_0_14_INDICATOR_ID, value_col="young")
+    working = _prepare_indicator_slice(AGE_15_64_INDICATOR_ID, value_col="working")
+    elderly = _prepare_indicator_slice(AGE_65_INDICATOR_ID, value_col="elderly")
+
+    if young.is_empty() or working.is_empty() or elderly.is_empty():
+        st.info("Age structure ternary is unavailable - source data missing.")
+        return
+
+    joined = young.join(working, on=["year", "economy"]).join(
+        elderly, on=["year", "economy"]
+    )
+    if joined.is_empty():
+        st.info("No overlapping age-structure observations.")
+        return
+
+    latest_year = int(joined.select(pl.col("year").max()).item())
+    snapshot = joined.filter(pl.col("year") == latest_year)
+
+    country_map = get_world_bank_country_mapping()
+    if not country_map.is_empty() and {"id", "value"}.issubset(set(country_map.columns)):
+        country_map = country_map.select(
+            [
+                pl.col("id").cast(pl.Utf8).str.to_uppercase().alias("economy"),
+                pl.col("value").cast(pl.Utf8).alias("country_name"),
+            ]
+        )
+        snapshot = snapshot.join(country_map, on="economy", how="left")
+    snapshot = snapshot.with_columns(
+        pl.col("country_name").fill_null(pl.col("economy")).alias("country_name")
+    )
+
+    selected_iso_codes = {
+        str(c).strip().upper()
+        for c in st.session_state.get(f"{PAGE_TITLE}_countries", [])
+        if str(c).strip()
+    }
+    snapshot = snapshot.with_columns(
+        pl.when(pl.col("economy").is_in(list(selected_iso_codes)))
+        .then(pl.lit("Selected"))
+        .otherwise(pl.lit("Other"))
+        .alias("group")
+    )
+
+    plot_df = snapshot.to_pandas()
+
+    fig = px.scatter_ternary(
+        plot_df,
+        a="young",
+        b="working",
+        c="elderly",
+        color="group",
+        category_orders={"group": ["Other", "Selected"]},
+        color_discrete_map={
+            "Other": get_color("reference_line"),
+            "Selected": get_colorway()[0],
+        },
+        hover_name="country_name",
+        hover_data={
+            "economy": True,
+            "young": ":.1f",
+            "working": ":.1f",
+            "elderly": ":.1f",
+            "group": False,
+        },
+        title=f"Age structure ({latest_year})",
+    )
+
+    selected_df = plot_df[plot_df["group"] == "Selected"]
+    if not selected_df.empty:
+        fig.add_trace(
+            go.Scatterternary(
+                a=selected_df["young"],
+                b=selected_df["working"],
+                c=selected_df["elderly"],
+                mode="text",
+                text=selected_df["economy"],
+                textposition="top center",
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
+
+    fig.update_traces(
+        selector={"mode": "markers"},
+        marker={"size": 9, "opacity": 0.78, "line": {"width": 0.5}},
+    )
+    fig.update_layout(
+        ternary={
+            "aaxis": {"title": "Young 0-14 (%)"},
+            "baxis": {"title": "Working 15-64 (%)"},
+            "caxis": {"title": "Elderly 65+ (%)"},
+        }
+    )
+    fig = apply_plotly_theme(fig)
+
+    st.plotly_chart(fig, width="stretch")
+    st.caption(
+        "Top vertex = young countries (high 0-14 share); bottom-left = working-"
+        "age heavy; bottom-right = aged societies. The demographic transition "
+        "moves countries clockwise from top down to the right."
+    )
+
+
 render_page_from_config(
-    page_title="Demography",
+    page_title=PAGE_TITLE,
     section_keys=["Demography"],
     caption=(
         "Explore population size, structure, and demographic dynamics to connect "
         "labor and social trends with macroeconomic outcomes."
     ),
     before_graphs_renderer=_render_demography_bubble,
+    after_graphs_renderer=_render_age_structure_deep_dive,
 )

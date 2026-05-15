@@ -1,3 +1,4 @@
+import plotly.express as px
 import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
@@ -8,9 +9,14 @@ from core.theming import get_color
 from core.postgres_client import (
     get_world_bank_country_codes,
     get_world_bank_country_mapping,
+    get_world_bank_country_regions,
     get_world_bank_indicator,
 )
 from pages.page_utils import render_page_from_config
+
+
+LIFE_EXP_INDICATOR_ID = "SP.DYN.LE00.IN"
+POPULATION_INDICATOR_ID = "SP.POP.TOTL"
 
 
 GDP_INDICATOR_ID = "NY.GDP.MKTP.CD"
@@ -302,6 +308,124 @@ def _render_gdp_overview() -> None:
     st.divider()
 
 
+def _prep_slice(df: pl.DataFrame, value_col: str) -> pl.DataFrame:
+    if df.is_empty() or not {"year", "economy", "value"}.issubset(set(df.columns)):
+        return pl.DataFrame()
+    return (
+        df.select(
+            [
+                pl.col("year").cast(pl.Int64, strict=False).alias("year"),
+                pl.col("economy").cast(pl.Utf8).str.to_uppercase().alias("economy"),
+                pl.col("value").cast(pl.Float64, strict=False).alias(value_col),
+            ]
+        )
+        .filter(
+            pl.col("year").is_not_null()
+            & pl.col("economy").is_not_null()
+            & pl.col(value_col).is_not_null()
+        )
+        .group_by(["year", "economy"])
+        .agg(pl.col(value_col).mean().alias(value_col))
+        .sort(["year", "economy"])
+    )
+
+
+def _render_development_transition_deep_dive() -> None:
+    st.divider()
+    st.subheader("Development Transition (Hans-Rosling animation)")
+    st.caption(
+        "Each bubble is a country. X = GDP per capita (current US$, log scale). "
+        "Y = life expectancy at birth. Size = total population. Color = World "
+        "Bank region. Use the play button or scrub the year slider to watch the "
+        "global development transition unfold."
+    )
+
+    gdp_pc = _prep_slice(
+        get_world_bank_indicator(GDP_PER_CAPITA_INDICATOR_ID, country_code="ALL"),
+        "gdp_pc",
+    )
+    life_exp = _prep_slice(
+        get_world_bank_indicator(LIFE_EXP_INDICATOR_ID, country_code="ALL"),
+        "life_exp",
+    )
+    pop = _prep_slice(
+        get_world_bank_indicator(POPULATION_INDICATOR_ID, country_code="ALL"),
+        "pop",
+    )
+
+    if gdp_pc.is_empty() or life_exp.is_empty() or pop.is_empty():
+        st.info("Development transition animation is unavailable - missing source data.")
+        return
+
+    regions_df = get_world_bank_country_regions()
+    if regions_df.is_empty() or not {"id", "value", "region"}.issubset(
+        set(regions_df.columns)
+    ):
+        st.info("Country region metadata is unavailable.")
+        return
+
+    regions_df = regions_df.select(
+        [
+            pl.col("id").cast(pl.Utf8).str.to_uppercase().alias("economy"),
+            pl.col("value").cast(pl.Utf8).alias("country_name"),
+            pl.col("region").cast(pl.Utf8).alias("region"),
+        ]
+    )
+
+    joined = (
+        gdp_pc.join(life_exp, on=["year", "economy"])
+        .join(pop, on=["year", "economy"])
+        .join(regions_df, on="economy", how="inner")
+        .filter(
+            (pl.col("gdp_pc") > 0) & (pl.col("life_exp") > 0) & (pl.col("pop") > 0)
+        )
+        .sort(["year", "economy"])
+    )
+
+    if joined.is_empty():
+        st.info("No overlapping observations for the development transition.")
+        return
+
+    plot_df = joined.to_pandas().sort_values(["year", "country_name"])
+    fig = px.scatter(
+        plot_df,
+        x="gdp_pc",
+        y="life_exp",
+        size="pop",
+        color="region",
+        animation_frame="year",
+        animation_group="economy",
+        hover_name="country_name",
+        hover_data={"economy": True, "gdp_pc": ":,.0f", "life_exp": ":.1f", "pop": ":,.0f", "region": True, "year": False},
+        log_x=True,
+        size_max=55,
+        range_x=[
+            max(100.0, float(plot_df["gdp_pc"].min()) * 0.8),
+            float(plot_df["gdp_pc"].max()) * 1.2,
+        ],
+        range_y=[
+            float(plot_df["life_exp"].min()) - 2.0,
+            float(plot_df["life_exp"].max()) + 2.0,
+        ],
+        labels={
+            "gdp_pc": "GDP per capita (US$, log)",
+            "life_exp": "Life expectancy at birth (years)",
+            "pop": "Population",
+            "region": "Region",
+        },
+        title="Income vs Longevity over time",
+    )
+    fig.update_traces(marker={"opacity": 0.7, "line": {"width": 0.5}})
+    fig = apply_plotly_theme(fig)
+
+    st.plotly_chart(fig, width="stretch")
+    st.caption(
+        "Inspired by Gapminder/Hans-Rosling. The rightward-and-upward drift over "
+        "time shows the global development transition: rising incomes alongside "
+        "longer lives, with regional clusters diverging then partially converging."
+    )
+
+
 render_page_from_config(
     page_title=PAGE_TITLE,
     section_keys=["General Economics Indicators"],
@@ -310,4 +434,5 @@ render_page_from_config(
         "map, trend, and distribution views."
     ),
     before_graphs_renderer=_render_gdp_overview,
+    after_graphs_renderer=_render_development_transition_deep_dive,
 )

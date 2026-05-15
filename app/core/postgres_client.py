@@ -198,3 +198,12 @@ def get_all_yahoo_metadata() -> pl.DataFrame:
 def get_world_bank_country_mapping() -> pl.DataFrame:
     query = "SELECT id, value FROM countries WHERE id IS NOT NULL AND value IS NOT NULL"
     return fetch_postgres_data(query=query)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_world_bank_country_regions() -> pl.DataFrame:
+    query = (
+        'SELECT id, value, "region.value" AS region '
+        "FROM countries WHERE id IS NOT NULL AND aggregate = false"
+    )
+    return fetch_postgres_data(query=query)
