@@ -802,93 +802,151 @@ class GraphBox:
         st.session_state[cache_key] = cached
         return description
 
+    def _render_header_and_settings(
+        self,
+        defaults: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Render the title bar and settings popover; return the chosen settings.
+
+        Mutates nothing on ``self``; the returned dict carries every choice
+        the rest of ``render_streamlit_ui`` needs (right_plot, forecast
+        params, distribution params, run-button click).
+        """
+        settings: dict[str, Any] = dict(defaults)
+
+        col_title, col_settings = st.columns([0.85, 0.15])
+        with col_title:
+            st.markdown(f"**{self.name}**")
+
+        with col_settings:
+            with st.popover("⚙️"):
+                st.markdown("**Layout**")
+                settings["right_plot"] = st.selectbox(
+                    "Right-side chart",
+                    ["time trend", "distribution"],
+                    index=0,
+                    key=f"{self.key_prefix}_right_plot",
+                )
+
+                st.divider()
+                if settings["right_plot"] == "time trend":
+                    st.markdown("**Time Series Forecasting**")
+                    with st.form(
+                        key=f"{self.key_prefix}_forecast_form",
+                        border=False,
+                    ):
+                        settings["selected_model"] = st.selectbox(
+                            "Model",
+                            ["prophet", "arima", "chronos"],
+                            index=0,
+                            key=f"{self.key_prefix}_model",
+                        )
+                        settings["alpha_value"] = st.slider(
+                            "Alpha",
+                            min_value=0.01,
+                            max_value=0.2,
+                            value=0.05,
+                            step=0.01,
+                            key=f"{self.key_prefix}_alpha",
+                        )
+                        settings["points_to_use"] = st.number_input(
+                            "Points to use",
+                            min_value=6,
+                            max_value=500,
+                            value=50,
+                            key=f"{self.key_prefix}_lookback",
+                        )
+                        settings["points_to_predict"] = st.number_input(
+                            "Points to predict",
+                            min_value=1,
+                            max_value=int(settings["points_to_use"]),
+                            value=min(10, int(settings["points_to_use"])),
+                            key=f"{self.key_prefix}_predict",
+                        )
+                        settings["run_model_clicked"] = st.form_submit_button(
+                            "Run model",
+                            type="primary",
+                            width="stretch",
+                        )
+                else:
+                    st.markdown("**Distribution**")
+                    settings["distribution_type"] = st.selectbox(
+                        "Distribution plot type",
+                        [
+                            "histplot",
+                            "normalized_histplot",
+                            "violinplot",
+                            "boxplot",
+                        ],
+                        index=0,
+                        key=f"{self.key_prefix}_distribution_type",
+                    )
+                    settings["distribution_orientation"] = st.selectbox(
+                        "Distribution orientation",
+                        ["vertical", "horizontal"],
+                        index=0,
+                        key=f"{self.key_prefix}_distribution_orientation",
+                    )
+
+        return settings
+
+    def _render_dropped_log_notes(
+        self,
+        right_plot: str,
+        dropped_map_points: int,
+        dropped_time_trend_points: int,
+        dropped_forecast_points: int,
+        dropped_distribution_points: int,
+        dropped_reference_points: int,
+    ) -> None:
+        notes: list[str] = []
+        if dropped_map_points:
+            notes.append(f"map: {dropped_map_points}")
+        if right_plot == "time trend":
+            if dropped_time_trend_points:
+                notes.append(f"time trend: {dropped_time_trend_points}")
+            if dropped_forecast_points:
+                notes.append(f"forecast: {dropped_forecast_points}")
+        else:
+            if dropped_distribution_points:
+                notes.append(f"distribution: {dropped_distribution_points}")
+            if dropped_reference_points:
+                notes.append(f"distribution reference lines: {dropped_reference_points}")
+
+        if notes:
+            st.caption(
+                "ln transform skipped non-positive values in "
+                + ", ".join(notes)
+                + "."
+            )
+
     @st.fragment
     def render_streamlit_ui(self):
         schema = self._get_schema_mapping()
-        distribution_type = "histplot"
-        distribution_orientation = "vertical"
         use_log_key = f"{self.key_prefix}_use_log_transform"
         use_log = bool(st.session_state.get(use_log_key, False))
-        selected_model = "prophet"
-        alpha_value = 0.05
-        points_to_use = 50
-        points_to_predict = 10
-        run_model_clicked = False
 
         with st.container(border=True):
-            col_title, col_settings = st.columns([0.85, 0.15])
-            with col_title:
-                st.markdown(f"**{self.name}**")
-
-            with col_settings:
-                with st.popover("⚙️"):
-                    st.markdown("**Layout**")
-                    right_plot = st.selectbox(
-                        "Right-side chart",
-                        ["time trend", "distribution"],
-                        index=0,
-                        key=f"{self.key_prefix}_right_plot",
-                    )
-
-                    st.divider()
-                    if right_plot == "time trend":
-                        st.markdown("**Time Series Forecasting**")
-                        with st.form(
-                            key=f"{self.key_prefix}_forecast_form",
-                            border=False,
-                        ):
-                            selected_model = st.selectbox(
-                                "Model",
-                                ["prophet", "arima", "chronos"],
-                                index=0,
-                                key=f"{self.key_prefix}_model",
-                            )
-                            alpha_value = st.slider(
-                                "Alpha",
-                                min_value=0.01,
-                                max_value=0.2,
-                                value=0.05,
-                                step=0.01,
-                                key=f"{self.key_prefix}_alpha",
-                            )
-                            points_to_use = st.number_input(
-                                "Points to use",
-                                min_value=6,
-                                max_value=500,
-                                value=50,
-                                key=f"{self.key_prefix}_lookback",
-                            )
-                            points_to_predict = st.number_input(
-                                "Points to predict",
-                                min_value=1,
-                                max_value=int(points_to_use),
-                                value=min(10, int(points_to_use)),
-                                key=f"{self.key_prefix}_predict",
-                            )
-                            run_model_clicked = st.form_submit_button(
-                                "Run model",
-                                type="primary",
-                                width="stretch",
-                            )
-                    else:
-                        st.markdown("**Distribution**")
-                        distribution_type = st.selectbox(
-                            "Distribution plot type",
-                            [
-                                "histplot",
-                                "normalized_histplot",
-                                "violinplot",
-                                "boxplot",
-                            ],
-                            index=0,
-                            key=f"{self.key_prefix}_distribution_type",
-                        )
-                        distribution_orientation = st.selectbox(
-                            "Distribution orientation",
-                            ["vertical", "horizontal"],
-                            index=0,
-                            key=f"{self.key_prefix}_distribution_orientation",
-                        )
+            settings = self._render_header_and_settings(
+                defaults={
+                    "right_plot": "time trend",
+                    "distribution_type": "histplot",
+                    "distribution_orientation": "vertical",
+                    "selected_model": "prophet",
+                    "alpha_value": 0.05,
+                    "points_to_use": 50,
+                    "points_to_predict": 10,
+                    "run_model_clicked": False,
+                },
+            )
+            right_plot = settings["right_plot"]
+            distribution_type = settings["distribution_type"]
+            distribution_orientation = settings["distribution_orientation"]
+            selected_model = settings["selected_model"]
+            alpha_value = settings["alpha_value"]
+            points_to_use = settings["points_to_use"]
+            points_to_predict = settings["points_to_predict"]
+            run_model_clicked = settings["run_model_clicked"]
 
             df_hist_raw = self._fetch_data()
             df_hist_non_null = df_hist_raw.filter(pl.col(schema["y"]).is_not_null())
@@ -1196,30 +1254,14 @@ class GraphBox:
                             st.error(f"Creative plot description failed: {exc}")
 
             if use_log:
-                dropped_notes: list[str] = []
-                if dropped_map_points:
-                    dropped_notes.append(f"map: {dropped_map_points}")
-                if right_plot == "time trend":
-                    if dropped_time_trend_points:
-                        dropped_notes.append(f"time trend: {dropped_time_trend_points}")
-                    if dropped_forecast_points:
-                        dropped_notes.append(f"forecast: {dropped_forecast_points}")
-                else:
-                    if dropped_distribution_points:
-                        dropped_notes.append(
-                            f"distribution: {dropped_distribution_points}"
-                        )
-                    if dropped_reference_points:
-                        dropped_notes.append(
-                            f"distribution reference lines: {dropped_reference_points}"
-                        )
-
-                if dropped_notes:
-                    st.caption(
-                        "ln transform skipped non-positive values in "
-                        + ", ".join(dropped_notes)
-                        + "."
-                    )
+                self._render_dropped_log_notes(
+                    right_plot=right_plot,
+                    dropped_map_points=dropped_map_points,
+                    dropped_time_trend_points=dropped_time_trend_points,
+                    dropped_forecast_points=dropped_forecast_points,
+                    dropped_distribution_points=dropped_distribution_points,
+                    dropped_reference_points=dropped_reference_points,
+                )
 
             if available_years:
                 st.slider(

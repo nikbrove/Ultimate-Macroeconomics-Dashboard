@@ -2,12 +2,12 @@ import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
 
+from core.page_helpers import fetch_indicator_slice
 from core.plotting import apply_plotly_theme
 from core.theming import get_color
 from core.postgres_client import (
     get_world_bank_country_codes,
     get_world_bank_country_mapping,
-    get_world_bank_indicator,
 )
 from pages.page_utils import render_page_from_config
 
@@ -18,32 +18,6 @@ ECONOMY_STRUCTURE_INDICATORS = [
     ("Services", "NV.SRV.TOTL.ZS", "sector_services"),
 ]
 PAGE_TITLE = "Economy Structure"
-
-
-def _prepare_indicator_slice(
-    indicator_id: str, country_code: str | list[str] = "ALL"
-) -> pl.DataFrame:
-    indicator_df = get_world_bank_indicator(indicator_id, country_code=country_code)
-    if indicator_df.is_empty() or not {"year", "economy", "value"}.issubset(
-        set(indicator_df.columns)
-    ):
-        return pl.DataFrame()
-
-    return (
-        indicator_df.with_columns(
-            [
-                pl.col("year").cast(pl.Int64, strict=False).alias("year"),
-                pl.col("economy").cast(pl.Utf8).str.to_uppercase().alias("economy"),
-                pl.col("value").cast(pl.Float64, strict=False).alias("value"),
-            ]
-        )
-        .filter(
-            pl.col("year").is_not_null()
-            & pl.col("economy").is_not_null()
-            & pl.col("value").is_not_null()
-        )
-        .sort(["year", "economy"])
-    )
 
 
 def _build_country_labels() -> tuple[list[str], dict[str, str], dict[str, str]]:
@@ -85,7 +59,7 @@ def _build_economy_structure_data(
     latest_common_year_df: pl.DataFrame | None = None
 
     for sector_name, indicator_id, _ in ECONOMY_STRUCTURE_INDICATORS:
-        sector_df = _prepare_indicator_slice(indicator_id, country_code=country_code)
+        sector_df = fetch_indicator_slice(indicator_id, country_code=country_code)
         if sector_df.is_empty():
             return pl.DataFrame(), None
 
@@ -204,13 +178,13 @@ def _build_sector_timeseries(country_code: str | None) -> tuple[pl.DataFrame, st
     rows: list[pl.DataFrame] = []
     for sector_name, indicator_id, _ in ECONOMY_STRUCTURE_INDICATORS:
         if country_code is None:
-            slice_df = _prepare_indicator_slice(indicator_id, country_code="ALL")
+            slice_df = fetch_indicator_slice(indicator_id, country_code="ALL")
             if slice_df.is_empty():
                 continue
             agg_df = slice_df.group_by("year").agg(pl.col("value").mean().alias(sector_name))
             slice_df = agg_df
         else:
-            slice_df = _prepare_indicator_slice(indicator_id, country_code=country_code)
+            slice_df = fetch_indicator_slice(indicator_id, country_code=country_code)
             if slice_df.is_empty():
                 continue
             slice_df = slice_df.select(["year", pl.col("value").alias(sector_name)])

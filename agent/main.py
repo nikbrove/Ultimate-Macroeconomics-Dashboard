@@ -1,12 +1,18 @@
+import asyncio
 import json
+import logging
 import os
 from functools import lru_cache
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from openai import OpenAI
+from openai import OpenAI, OpenAIError
 from starlette.responses import StreamingResponse
 import yaml
+
+logger = logging.getLogger(__name__)
+
+STREAM_TIMEOUT_SECONDS = 300
 
 from agent.graph import MacroAgentGraph
 from agent.schemas import (
@@ -117,7 +123,8 @@ def list_models() -> dict[str, list[str]]:
     try:
         models = _get_openai_client().models.list()
         return {"models": [m.id for m in models.data]}
-    except Exception:
+    except OpenAIError as exc:
+        logger.warning("Could not list OpenAI models: %s", exc)
         return {"models": [AGENT_MODEL or ""]}
 
 
@@ -128,32 +135,46 @@ async def process_chat_stream(request: ChatRequest):
     usage_tracker = UsageTracker()
 
     async def event_generator():
-        async for event in agent.astream_events(
-            message=request.user_message,
-            chat_history=chat_history,
-            usage_tracker=usage_tracker,
-        ):
-            event_type = event.get("type", "step")
-            if event_type == "step":
-                payload = {"type": "step", "node": event.get("node", "")}
-            elif event_type == "token":
-                payload = {"type": "token", "delta": event.get("delta", "")}
-            elif event_type == "final":
-                payload = {
-                    "type": "final",
-                    "answer": str(event.get("response", "")),
-                    "model": AGENT_MODEL or "",
-                    "artifacts": event.get("artifacts", {}),
-                    "usage": usage_tracker.snapshot(default_model=AGENT_MODEL or ""),
-                }
-            elif event_type == "error":
-                payload = {
-                    "type": "error",
-                    "answer": str(event.get("response", "")),
-                }
-            else:
-                continue
-            yield f"data: {json.dumps(payload, default=str)}\n\n"
+        try:
+            async with asyncio.timeout(STREAM_TIMEOUT_SECONDS):
+                async for event in agent.astream_events(
+                    message=request.user_message,
+                    chat_history=chat_history,
+                    usage_tracker=usage_tracker,
+                ):
+                    event_type = event.get("type", "step")
+                    if event_type == "step":
+                        payload = {"type": "step", "node": event.get("node", "")}
+                    elif event_type == "token":
+                        payload = {"type": "token", "delta": event.get("delta", "")}
+                    elif event_type == "final":
+                        payload = {
+                            "type": "final",
+                            "answer": str(event.get("response", "")),
+                            "model": AGENT_MODEL or "",
+                            "artifacts": event.get("artifacts", {}),
+                            "usage": usage_tracker.snapshot(default_model=AGENT_MODEL or ""),
+                        }
+                    elif event_type == "error":
+                        payload = {
+                            "type": "error",
+                            "answer": str(event.get("response", "")),
+                        }
+                    else:
+                        continue
+                    yield f"data: {json.dumps(payload, default=str)}\n\n"
+        except asyncio.TimeoutError:
+            logger.warning(
+                "/chat/stream: agent stream exceeded %ss timeout", STREAM_TIMEOUT_SECONDS
+            )
+            timeout_payload = {
+                "type": "error",
+                "answer": (
+                    f"The agent took longer than {STREAM_TIMEOUT_SECONDS}s to respond and "
+                    "was cancelled. Try a more specific question."
+                ),
+            }
+            yield f"data: {json.dumps(timeout_payload)}\n\n"
 
     return StreamingResponse(
         event_generator(),
@@ -187,7 +208,8 @@ async def interpret_plot(request: PlotInterpretationRequest):
         if request.chart_context.strip():
             user_text += f"\nContext: {request.chart_context.strip()}"
 
-        completion = client.chat.completions.create(
+        completion = await asyncio.to_thread(
+            client.chat.completions.create,
             model=AGENT_MODEL,
             temperature=temperature,
             messages=[
@@ -225,5 +247,9 @@ async def interpret_plot(request: PlotInterpretationRequest):
             model=AGENT_MODEL or "",
             usage=token_usage,
         )
+    except OpenAIError as exc:
+        logger.exception("/plots/interpret: OpenAI call failed")
+        raise HTTPException(status_code=502, detail=f"OpenAI error: {exc}") from exc
     except Exception as exc:
+        logger.exception("/plots/interpret: unexpected error")
         raise HTTPException(status_code=500, detail=str(exc)) from exc

@@ -6,10 +6,10 @@ import streamlit as st
 from core.assets import get_markup_template, render_markup_template
 from core.plotting import apply_plotly_theme
 from core.theming import get_color
+from core.page_helpers import fetch_indicator_slice
 from core.postgres_client import (
     get_world_bank_country_mapping,
     get_world_bank_country_regions,
-    get_world_bank_indicator,
 )
 from pages.page_utils import render_page_from_config
 
@@ -34,32 +34,6 @@ def _format_large_usd(value: float) -> str:
     if abs_value >= 1_000_000:
         return f"${value / 1_000_000:.2f}M"
     return f"${value:,.0f}"
-
-
-def _prepare_indicator_slice(
-    indicator_id: str, country_code: str | list[str] = "ALL"
-) -> pl.DataFrame:
-    indicator_df = get_world_bank_indicator(indicator_id, country_code=country_code)
-    if indicator_df.is_empty() or not {"year", "economy", "value"}.issubset(
-        set(indicator_df.columns)
-    ):
-        return pl.DataFrame()
-
-    return (
-        indicator_df.with_columns(
-            [
-                pl.col("year").cast(pl.Int64, strict=False).alias("year"),
-                pl.col("economy").cast(pl.Utf8).str.to_uppercase().alias("economy"),
-                pl.col("value").cast(pl.Float64, strict=False).alias("value"),
-            ]
-        )
-        .filter(
-            pl.col("year").is_not_null()
-            & pl.col("economy").is_not_null()
-            & pl.col("value").is_not_null()
-        )
-        .sort(["year", "economy"])
-    )
 
 
 def _compute_summary(
@@ -173,8 +147,8 @@ def _build_gdp_share_pie(share_df: pl.DataFrame, title: str) -> go.Figure:
 
 
 def _render_gdp_overview() -> None:
-    gdp_df = _prepare_indicator_slice(GDP_INDICATOR_ID)
-    gdp_per_capita_df = _prepare_indicator_slice(GDP_PER_CAPITA_INDICATOR_ID)
+    gdp_df = fetch_indicator_slice(GDP_INDICATOR_ID)
+    gdp_per_capita_df = fetch_indicator_slice(GDP_PER_CAPITA_INDICATOR_ID)
 
     if gdp_df.is_empty():
         st.info("GDP summary is unavailable right now.")
@@ -307,28 +281,6 @@ def _render_gdp_overview() -> None:
     st.divider()
 
 
-def _prep_slice(df: pl.DataFrame, value_col: str) -> pl.DataFrame:
-    if df.is_empty() or not {"year", "economy", "value"}.issubset(set(df.columns)):
-        return pl.DataFrame()
-    return (
-        df.select(
-            [
-                pl.col("year").cast(pl.Int64, strict=False).alias("year"),
-                pl.col("economy").cast(pl.Utf8).str.to_uppercase().alias("economy"),
-                pl.col("value").cast(pl.Float64, strict=False).alias(value_col),
-            ]
-        )
-        .filter(
-            pl.col("year").is_not_null()
-            & pl.col("economy").is_not_null()
-            & pl.col(value_col).is_not_null()
-        )
-        .group_by(["year", "economy"])
-        .agg(pl.col(value_col).mean().alias(value_col))
-        .sort(["year", "economy"])
-    )
-
-
 def _render_development_transition_deep_dive() -> None:
     st.divider()
     st.subheader("Development Transition (Hans-Rosling animation)")
@@ -339,18 +291,9 @@ def _render_development_transition_deep_dive() -> None:
         "global development transition unfold."
     )
 
-    gdp_pc = _prep_slice(
-        get_world_bank_indicator(GDP_PER_CAPITA_INDICATOR_ID, country_code="ALL"),
-        "gdp_pc",
-    )
-    life_exp = _prep_slice(
-        get_world_bank_indicator(LIFE_EXP_INDICATOR_ID, country_code="ALL"),
-        "life_exp",
-    )
-    pop = _prep_slice(
-        get_world_bank_indicator(POPULATION_INDICATOR_ID, country_code="ALL"),
-        "pop",
-    )
+    gdp_pc = fetch_indicator_slice(GDP_PER_CAPITA_INDICATOR_ID, value_col="gdp_pc")
+    life_exp = fetch_indicator_slice(LIFE_EXP_INDICATOR_ID, value_col="life_exp")
+    pop = fetch_indicator_slice(POPULATION_INDICATOR_ID, value_col="pop")
 
     if gdp_pc.is_empty() or life_exp.is_empty() or pop.is_empty():
         st.info("Development transition animation is unavailable - missing source data.")

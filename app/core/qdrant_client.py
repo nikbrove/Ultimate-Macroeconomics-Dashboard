@@ -72,8 +72,6 @@ def scroll_collection(
     offset = None
 
     try:
-        all_records = []
-        offset = None
         while True:
             records, offset = client.scroll(
                 collection_name=collection_name,

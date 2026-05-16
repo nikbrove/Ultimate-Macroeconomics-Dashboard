@@ -4,6 +4,41 @@ All notable changes to **Ultimate Macroeconomics Dashboard** are documented in t
 
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v0.8]
+
+Codebase-wide refactoring pass across all ten containers. No new user-facing features — the goals were dedup, dead-code removal, async-safety, error-handling hardening, and modular structure. Same architecture, same UI, cleaner internals.
+
+### Added
+- **`app/core/page_helpers.py`** — shared `prepare_indicator_slice` + `fetch_indicator_slice` helpers that replace 10 verbatim copies of `_prepare_indicator_slice` previously inlined in `app/pages/01..10_*.py`. Dashboard pages now import these instead of re-implementing the same World Bank normalization recipe each time.
+- **`agent/agent/prompts.py`** — central location for the LangGraph system prompts (147-line supervisor prompt and the guardrail prompt), pulled out of `graph.py` for readability.
+- **`python_sandbox`: `RLIMIT_AS` (2 GB) and `RLIMIT_CPU`** applied to the subprocess running LLM-generated code (via `preexec_fn`). Previously only a wall-clock timeout existed; misbehaving code now gets killed by the kernel instead of starving the container.
+- **`agent /chat/stream`: 5-minute SSE stream timeout.** An `asyncio.timeout(...)` guard wraps `astream_events`; on timeout the client receives a final `error` event instead of an open-ended stream.
+- **`forecaster`: `FORECASTER_CONFIG_PATH` env var** to override the default `config.yaml` location.
+
+### Changed
+- **`forecaster /predict` and `clustering /cluster` are now `async def`** with the CPU-bound work dispatched via `fastapi.concurrency.run_in_threadpool(...)`. Previously the sync handlers blocked the FastAPI event loop for the entire duration of `Prophet.fit()` / `auto_arima()` / `TSNE.fit_transform()`.
+- **`forecaster` model cache is now thread-safe.** Moved from a module-level dict to `app.state.model_cache` + `asyncio.Lock` with double-checked locking; concurrent first-time requests for the same model no longer race on heavy ML imports.
+- **`agent /plots/interpret` no longer blocks the event loop.** The blocking `openai.OpenAI.chat.completions.create(...)` call is now wrapped with `asyncio.to_thread(...)`.
+- **`app/core/api_client.py` error messages.** All `RuntimeError`s wrapping HTTP failures now include the actual status code and a body excerpt instead of the misleading "No available base URL candidates" string.
+- **`app/core/plotting.py: GraphBox.render_streamlit_ui`** decomposed: the settings popover and the dropped-log-points caption were extracted into helper methods, reducing the 435-line monolith.
+- **`agent/agent/graph.py`** worker `except Exception` blocks now call `logger.exception(...)` before returning the fallback result, so failures show up in container logs instead of vanishing.
+- **`python_sandbox/main.py`** logs subprocess start, finish, and temp-file cleanup outcomes.
+- **`downloader_general`**: post-download `sleep(10)` is now a configurable class attribute (`between_download_sleep_seconds`).
+- **`forecaster /models`, `agent /models`, and assorted page settings** narrowed bare `except Exception:` to specific exceptions with logging.
+
+### Removed
+- **10 duplicated copies** of `_prepare_indicator_slice` across `app/pages/01..10_*.py` (~250 lines of dead duplication).
+- **Unused `pandas==3.0.1`** from `downloader_extra/requirements.txt` (~50 MB image bloat).
+- **`successfull_connections` field** from `downloader_general/src/extractors/world_bank_download.py` (set but never read; also fixed the typo by deletion).
+- **Duplicated `all_records = []` / `offset = None` initialization** in `app/core/qdrant_client.py` (copy-paste artifact).
+
+### Deferred (called out, not done in this pass)
+- Splitting `agent/agent/graph.py` (~1.5k lines) into per-worker modules under `agent/agent/workers/`.
+- Rewriting `plotly.express` chart calls in dashboard pages to consume polars natively (removing the remaining `.to_pandas()` conversions). The remaining sites rely on pandas-specific boolean masking / `.empty` / `.fillna` patterns and would need a careful go.Figure rewrite.
+- Shared `wb_api.py` between `downloader_general` and `downloader_extra` (requires multi-service file sharing).
+- Replacing pandas with polars internally in the `forecaster` models.
+- Adding the missing PostgreSQL indexes via a `db_init` migration.
+
 ## [v0.7]
 
 Improvements of descriptions for the dashboard

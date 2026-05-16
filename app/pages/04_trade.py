@@ -3,41 +3,17 @@ import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
 
+from core.page_helpers import fetch_indicator_slice
 from core.plotting import apply_plotly_theme
 from core.theming import get_color
 from core.postgres_client import (
     get_world_bank_country_mapping,
-    get_world_bank_indicator,
 )
 from pages.page_utils import render_page_from_config
 
 
 IMPORT_INDICATOR_ID = "NE.IMP.GNFS.ZS"
 EXPORT_INDICATOR_ID = "NE.EXP.GNFS.ZS"
-
-
-def _prepare_indicator_slice(df: pl.DataFrame, value_col: str) -> pl.DataFrame:
-    required_cols = {"year", "economy", "value"}
-    if df.is_empty() or not required_cols.issubset(set(df.columns)):
-        return pl.DataFrame()
-
-    return (
-        df.select(
-            [
-                pl.col("year").cast(pl.Int64, strict=False).alias("year"),
-                pl.col("economy").cast(pl.Utf8).str.to_uppercase().alias("economy"),
-                pl.col("value").cast(pl.Float64, strict=False).alias(value_col),
-            ]
-        )
-        .filter(
-            pl.col("year").is_not_null()
-            & pl.col("economy").is_not_null()
-            & pl.col(value_col).is_not_null()
-        )
-        .group_by(["year", "economy"])
-        .agg(pl.col(value_col).mean().alias(value_col))
-        .sort(["year", "economy"])
-    )
 
 
 def _render_import_export_scatter() -> None:
@@ -47,14 +23,8 @@ def _render_import_export_scatter() -> None:
         "the same year and country."
     )
 
-    imports_df = _prepare_indicator_slice(
-        get_world_bank_indicator(IMPORT_INDICATOR_ID, country_code="ALL"),
-        value_col="imports_pct_gdp",
-    )
-    exports_df = _prepare_indicator_slice(
-        get_world_bank_indicator(EXPORT_INDICATOR_ID, country_code="ALL"),
-        value_col="exports_pct_gdp",
-    )
+    imports_df = fetch_indicator_slice(IMPORT_INDICATOR_ID, value_col="imports_pct_gdp")
+    exports_df = fetch_indicator_slice(EXPORT_INDICATOR_ID, value_col="exports_pct_gdp")
 
     if imports_df.is_empty() or exports_df.is_empty():
         st.info(
@@ -191,26 +161,11 @@ def _render_export_composition_deep_dive() -> None:
         "the highlight colour even if outside the top-20."
     )
 
-    manf = _prepare_indicator_slice(
-        get_world_bank_indicator(MANUFACTURES_INDICATOR_ID, country_code="ALL"),
-        value_col="manf_pct",
-    )
-    food = _prepare_indicator_slice(
-        get_world_bank_indicator(FOOD_INDICATOR_ID, country_code="ALL"),
-        value_col="food_pct",
-    )
-    fuel = _prepare_indicator_slice(
-        get_world_bank_indicator(FUEL_INDICATOR_ID, country_code="ALL"),
-        value_col="fuel_pct",
-    )
-    exp_gdp = _prepare_indicator_slice(
-        get_world_bank_indicator(EXPORT_INDICATOR_ID, country_code="ALL"),
-        value_col="exp_gdp",
-    )
-    gdp = _prepare_indicator_slice(
-        get_world_bank_indicator(GDP_INDICATOR_ID, country_code="ALL"),
-        value_col="gdp",
-    )
+    manf = fetch_indicator_slice(MANUFACTURES_INDICATOR_ID, value_col="manf_pct")
+    food = fetch_indicator_slice(FOOD_INDICATOR_ID, value_col="food_pct")
+    fuel = fetch_indicator_slice(FUEL_INDICATOR_ID, value_col="fuel_pct")
+    exp_gdp = fetch_indicator_slice(EXPORT_INDICATOR_ID, value_col="exp_gdp")
+    gdp = fetch_indicator_slice(GDP_INDICATOR_ID, value_col="gdp")
 
     if any(df.is_empty() for df in (manf, food, fuel, exp_gdp, gdp)):
         st.info("Export composition is unavailable - source data missing.")

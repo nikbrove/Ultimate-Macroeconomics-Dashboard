@@ -3,11 +3,11 @@ import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
 
+from core.page_helpers import fetch_indicator_slice
 from core.plotting import apply_plotly_theme
 from core.theming import get_color, get_colorway
 from core.postgres_client import (
     get_world_bank_country_mapping,
-    get_world_bank_indicator,
 )
 from pages.page_utils import render_page_from_config
 
@@ -15,30 +15,6 @@ from pages.page_utils import render_page_from_config
 PAGE_TITLE = "Education and Human Capital"
 LITERACY_INDICATOR_ID = "SE.ADT.LITR.ZS"
 RESEARCHERS_INDICATOR_ID = "SP.POP.SCIE.RD.P6"
-
-
-def _prepare_indicator_slice(df: pl.DataFrame, value_col: str) -> pl.DataFrame:
-    required_cols = {"year", "economy", "value"}
-    if df.is_empty() or not required_cols.issubset(set(df.columns)):
-        return pl.DataFrame()
-
-    return (
-        df.select(
-            [
-                pl.col("year").cast(pl.Int64, strict=False).alias("year"),
-                pl.col("economy").cast(pl.Utf8).str.to_uppercase().alias("economy"),
-                pl.col("value").cast(pl.Float64, strict=False).alias(value_col),
-            ]
-        )
-        .filter(
-            pl.col("year").is_not_null()
-            & pl.col("economy").is_not_null()
-            & pl.col(value_col).is_not_null()
-        )
-        .group_by(["year", "economy"])
-        .agg(pl.col(value_col).mean().alias(value_col))
-        .sort(["year", "economy"])
-    )
 
 
 def _latest_per_country(df: pl.DataFrame, value_col: str, year_col: str) -> pl.DataFrame:
@@ -64,13 +40,9 @@ def _render_literacy_vs_researchers_overview() -> None:
         "year per country (the year is shown in the tooltip)."
     )
 
-    literacy_df = _prepare_indicator_slice(
-        get_world_bank_indicator(LITERACY_INDICATOR_ID, country_code="ALL"),
-        value_col="literacy_pct",
-    )
-    researchers_df = _prepare_indicator_slice(
-        get_world_bank_indicator(RESEARCHERS_INDICATOR_ID, country_code="ALL"),
-        value_col="researchers_per_million",
+    literacy_df = fetch_indicator_slice(LITERACY_INDICATOR_ID, value_col="literacy_pct")
+    researchers_df = fetch_indicator_slice(
+        RESEARCHERS_INDICATOR_ID, value_col="researchers_per_million"
     )
 
     if literacy_df.is_empty() or researchers_df.is_empty():
@@ -200,18 +172,9 @@ def _render_enrollment_ladder_deep_dive() -> None:
         "100% reflect over-age enrollment, not full coverage."
     )
 
-    prim = _prepare_indicator_slice(
-        get_world_bank_indicator(PRIMARY_INDICATOR_ID, country_code="ALL"),
-        value_col="primary",
-    )
-    sec_ = _prepare_indicator_slice(
-        get_world_bank_indicator(SECONDARY_INDICATOR_ID, country_code="ALL"),
-        value_col="secondary",
-    )
-    ter = _prepare_indicator_slice(
-        get_world_bank_indicator(TERTIARY_INDICATOR_ID, country_code="ALL"),
-        value_col="tertiary",
-    )
+    prim = fetch_indicator_slice(PRIMARY_INDICATOR_ID, value_col="primary")
+    sec_ = fetch_indicator_slice(SECONDARY_INDICATOR_ID, value_col="secondary")
+    ter = fetch_indicator_slice(TERTIARY_INDICATOR_ID, value_col="tertiary")
 
     if prim.is_empty() and sec_.is_empty() and ter.is_empty():
         st.info("Enrollment ladder data is unavailable.")

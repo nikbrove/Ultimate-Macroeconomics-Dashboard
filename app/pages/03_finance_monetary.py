@@ -3,11 +3,11 @@ import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
 
+from core.page_helpers import fetch_indicator_slice
 from core.plotting import apply_plotly_theme
 from core.theming import get_color, get_colorway
 from core.postgres_client import (
     get_world_bank_country_mapping,
-    get_world_bank_indicator,
 )
 from pages.page_utils import render_page_from_config
 
@@ -15,30 +15,6 @@ from pages.page_utils import render_page_from_config
 PAGE_TITLE = "Finance and Monetary"
 INFLATION_INDICATOR_ID = "FP.CPI.TOTL.ZG"
 REAL_RATE_INDICATOR_ID = "FR.INR.RINR"
-
-
-def _prepare_indicator_slice(df: pl.DataFrame, value_col: str) -> pl.DataFrame:
-    required_cols = {"year", "economy", "value"}
-    if df.is_empty() or not required_cols.issubset(set(df.columns)):
-        return pl.DataFrame()
-
-    return (
-        df.select(
-            [
-                pl.col("year").cast(pl.Int64, strict=False).alias("year"),
-                pl.col("economy").cast(pl.Utf8).str.to_uppercase().alias("economy"),
-                pl.col("value").cast(pl.Float64, strict=False).alias(value_col),
-            ]
-        )
-        .filter(
-            pl.col("year").is_not_null()
-            & pl.col("economy").is_not_null()
-            & pl.col(value_col).is_not_null()
-        )
-        .group_by(["year", "economy"])
-        .agg(pl.col(value_col).mean().alias(value_col))
-        .sort(["year", "economy"])
-    )
 
 
 def _render_inflation_vs_rate_overview() -> None:
@@ -50,14 +26,8 @@ def _render_inflation_vs_rate_overview() -> None:
         "fighting price pressures."
     )
 
-    inflation_df = _prepare_indicator_slice(
-        get_world_bank_indicator(INFLATION_INDICATOR_ID, country_code="ALL"),
-        value_col="inflation_pct",
-    )
-    rate_df = _prepare_indicator_slice(
-        get_world_bank_indicator(REAL_RATE_INDICATOR_ID, country_code="ALL"),
-        value_col="real_rate_pct",
-    )
+    inflation_df = fetch_indicator_slice(INFLATION_INDICATOR_ID, value_col="inflation_pct")
+    rate_df = fetch_indicator_slice(REAL_RATE_INDICATOR_ID, value_col="real_rate_pct")
 
     if inflation_df.is_empty() or rate_df.is_empty():
         st.info(
@@ -201,14 +171,8 @@ def _render_inflation_heatmap_deep_dive() -> None:
         "everything else. Countries from your multiselect are outlined."
     )
 
-    inflation_df = _prepare_indicator_slice(
-        get_world_bank_indicator(INFLATION_INDICATOR_ID, country_code="ALL"),
-        value_col="cpi",
-    )
-    population_df = _prepare_indicator_slice(
-        get_world_bank_indicator(POPULATION_INDICATOR_ID, country_code="ALL"),
-        value_col="pop",
-    )
+    inflation_df = fetch_indicator_slice(INFLATION_INDICATOR_ID, value_col="cpi")
+    population_df = fetch_indicator_slice(POPULATION_INDICATOR_ID, value_col="pop")
 
     if inflation_df.is_empty() or population_df.is_empty():
         st.info("Inflation heatmap is unavailable - source data missing.")

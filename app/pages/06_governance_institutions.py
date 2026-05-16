@@ -2,11 +2,11 @@ import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
 
+from core.page_helpers import fetch_indicator_slice
 from core.plotting import apply_plotly_theme
 from core.theming import get_color, get_colorway
 from core.postgres_client import (
     get_world_bank_country_mapping,
-    get_world_bank_indicator,
 )
 from pages.page_utils import render_page_from_config
 
@@ -23,31 +23,10 @@ WGI_DIMENSIONS: list[tuple[str, str]] = [
 ]
 
 
-def _prepare_indicator_slice(df: pl.DataFrame, value_col: str) -> pl.DataFrame:
-    required_cols = {"year", "economy", "value"}
-    if df.is_empty() or not required_cols.issubset(set(df.columns)):
-        return pl.DataFrame()
-
-    return df.select(
-        [
-            pl.col("year").cast(pl.Int64, strict=False).alias("year"),
-            pl.col("economy").cast(pl.Utf8).str.to_uppercase().alias("economy"),
-            pl.col("value").cast(pl.Float64, strict=False).alias(value_col),
-        ]
-    ).filter(
-        pl.col("year").is_not_null()
-        & pl.col("economy").is_not_null()
-        & pl.col(value_col).is_not_null()
-    )
-
-
 def _build_wgi_panel() -> pl.DataFrame:
     panel: pl.DataFrame | None = None
     for indicator_id, label in WGI_DIMENSIONS:
-        slice_df = _prepare_indicator_slice(
-            get_world_bank_indicator(indicator_id, country_code="ALL"),
-            value_col=label,
-        )
+        slice_df = fetch_indicator_slice(indicator_id, value_col=label)
         if slice_df.is_empty():
             continue
         panel = (
@@ -211,10 +190,7 @@ def _render_wgi_heatmap_deep_dive() -> None:
     )
     indicator_id = label_to_id[selected_dim]
 
-    series = _prepare_indicator_slice(
-        get_world_bank_indicator(indicator_id, country_code="ALL"),
-        value_col="wgi",
-    )
+    series = fetch_indicator_slice(indicator_id, value_col="wgi")
     if series.is_empty():
         st.info("Heatmap data is unavailable.")
         return

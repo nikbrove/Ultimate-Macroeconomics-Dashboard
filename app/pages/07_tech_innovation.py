@@ -3,11 +3,11 @@ import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
 
+from core.page_helpers import fetch_indicator_slice
 from core.plotting import apply_plotly_theme
 from core.theming import get_color, get_colorway
 from core.postgres_client import (
     get_world_bank_country_mapping,
-    get_world_bank_indicator,
 )
 from pages.page_utils import render_page_from_config
 
@@ -18,30 +18,6 @@ HIGHTECH_INDICATOR_ID = "TX.VAL.TECH.CD"
 GDP_INDICATOR_ID = "NY.GDP.MKTP.CD"
 
 
-def _prepare_indicator_slice(df: pl.DataFrame, value_col: str) -> pl.DataFrame:
-    required_cols = {"year", "economy", "value"}
-    if df.is_empty() or not required_cols.issubset(set(df.columns)):
-        return pl.DataFrame()
-
-    return (
-        df.select(
-            [
-                pl.col("year").cast(pl.Int64, strict=False).alias("year"),
-                pl.col("economy").cast(pl.Utf8).str.to_uppercase().alias("economy"),
-                pl.col("value").cast(pl.Float64, strict=False).alias(value_col),
-            ]
-        )
-        .filter(
-            pl.col("year").is_not_null()
-            & pl.col("economy").is_not_null()
-            & pl.col(value_col).is_not_null()
-        )
-        .group_by(["year", "economy"])
-        .agg(pl.col(value_col).mean().alias(value_col))
-        .sort(["year", "economy"])
-    )
-
-
 def _render_rd_vs_hightech_overview() -> None:
     st.subheader("R&D Intensity vs High-Tech Exports")
     st.caption(
@@ -49,18 +25,9 @@ def _render_rd_vs_hightech_overview() -> None:
         "export value for the same year. Bubble size scales with GDP."
     )
 
-    rnd_df = _prepare_indicator_slice(
-        get_world_bank_indicator(RND_INDICATOR_ID, country_code="ALL"),
-        value_col="rnd_pct_gdp",
-    )
-    hightech_df = _prepare_indicator_slice(
-        get_world_bank_indicator(HIGHTECH_INDICATOR_ID, country_code="ALL"),
-        value_col="hightech_usd",
-    )
-    gdp_df = _prepare_indicator_slice(
-        get_world_bank_indicator(GDP_INDICATOR_ID, country_code="ALL"),
-        value_col="gdp_usd",
-    )
+    rnd_df = fetch_indicator_slice(RND_INDICATOR_ID, value_col="rnd_pct_gdp")
+    hightech_df = fetch_indicator_slice(HIGHTECH_INDICATOR_ID, value_col="hightech_usd")
+    gdp_df = fetch_indicator_slice(GDP_INDICATOR_ID, value_col="gdp_usd")
 
     if rnd_df.is_empty() or hightech_df.is_empty():
         st.info(
@@ -210,14 +177,8 @@ def _render_digital_adoption_deep_dive() -> None:
         "shows the global cross-country mean."
     )
 
-    internet = _prepare_indicator_slice(
-        get_world_bank_indicator(INTERNET_INDICATOR_ID, country_code="ALL"),
-        value_col="internet_pct",
-    )
-    mobile = _prepare_indicator_slice(
-        get_world_bank_indicator(MOBILE_INDICATOR_ID, country_code="ALL"),
-        value_col="mobile_per_100",
-    )
+    internet = fetch_indicator_slice(INTERNET_INDICATOR_ID, value_col="internet_pct")
+    mobile = fetch_indicator_slice(MOBILE_INDICATOR_ID, value_col="mobile_per_100")
 
     if internet.is_empty() or mobile.is_empty():
         st.info("Digital adoption data is unavailable.")

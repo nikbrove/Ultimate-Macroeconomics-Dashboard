@@ -3,12 +3,12 @@ import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
 
+from core.page_helpers import fetch_indicator_slice
 from core.plotting import apply_plotly_theme
 from core.theming import get_color, get_colorway
 from core.postgres_client import (
     get_world_bank_country_mapping,
     get_world_bank_country_regions,
-    get_world_bank_indicator,
 )
 from pages.page_utils import render_page_from_config
 
@@ -19,30 +19,6 @@ LIFE_EXP_MALE_ID = "SP.DYN.LE00.MA.IN"
 TOP_N_GAPS = 15
 
 
-def _prepare_indicator_slice(df: pl.DataFrame, value_col: str) -> pl.DataFrame:
-    required_cols = {"year", "economy", "value"}
-    if df.is_empty() or not required_cols.issubset(set(df.columns)):
-        return pl.DataFrame()
-
-    return (
-        df.select(
-            [
-                pl.col("year").cast(pl.Int64, strict=False).alias("year"),
-                pl.col("economy").cast(pl.Utf8).str.to_uppercase().alias("economy"),
-                pl.col("value").cast(pl.Float64, strict=False).alias(value_col),
-            ]
-        )
-        .filter(
-            pl.col("year").is_not_null()
-            & pl.col("economy").is_not_null()
-            & pl.col(value_col).is_not_null()
-        )
-        .group_by(["year", "economy"])
-        .agg(pl.col(value_col).mean().alias(value_col))
-        .sort(["year", "economy"])
-    )
-
-
 def _render_life_expectancy_gap_overview() -> None:
     st.subheader("Life Expectancy Gender Gap")
     st.caption(
@@ -50,14 +26,8 @@ def _render_life_expectancy_gap_overview() -> None:
         "mean women outlive men, the typical worldwide pattern."
     )
 
-    female_df = _prepare_indicator_slice(
-        get_world_bank_indicator(LIFE_EXP_FEMALE_ID, country_code="ALL"),
-        value_col="life_exp_female",
-    )
-    male_df = _prepare_indicator_slice(
-        get_world_bank_indicator(LIFE_EXP_MALE_ID, country_code="ALL"),
-        value_col="life_exp_male",
-    )
+    female_df = fetch_indicator_slice(LIFE_EXP_FEMALE_ID, value_col="life_exp_female")
+    male_df = fetch_indicator_slice(LIFE_EXP_MALE_ID, value_col="life_exp_male")
 
     if female_df.is_empty() or male_df.is_empty():
         st.info(
@@ -207,18 +177,9 @@ def _render_health_transition_deep_dive() -> None:
         "fertility and child mortality fall together as development progresses."
     )
 
-    fert = _prepare_indicator_slice(
-        get_world_bank_indicator(FERTILITY_INDICATOR_ID, country_code="ALL"),
-        value_col="tfr",
-    )
-    u5 = _prepare_indicator_slice(
-        get_world_bank_indicator(UNDER5_INDICATOR_ID, country_code="ALL"),
-        value_col="u5m",
-    )
-    pop = _prepare_indicator_slice(
-        get_world_bank_indicator(POPULATION_INDICATOR_ID, country_code="ALL"),
-        value_col="pop",
-    )
+    fert = fetch_indicator_slice(FERTILITY_INDICATOR_ID, value_col="tfr")
+    u5 = fetch_indicator_slice(UNDER5_INDICATOR_ID, value_col="u5m")
+    pop = fetch_indicator_slice(POPULATION_INDICATOR_ID, value_col="pop")
     regions_df = get_world_bank_country_regions()
 
     if any(df.is_empty() for df in (fert, u5, pop)) or regions_df.is_empty():

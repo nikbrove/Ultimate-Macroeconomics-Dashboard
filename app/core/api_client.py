@@ -6,6 +6,17 @@ from typing import Any
 from core.app_logging import log_http_request
 
 
+def _http_error_message(endpoint: str, exc: requests.RequestException) -> str:
+    response = getattr(exc, "response", None)
+    if response is None:
+        return f"{endpoint} request failed: {exc}"
+    body_excerpt = (response.text or "")[:300].strip()
+    return (
+        f"{endpoint} returned HTTP {response.status_code}"
+        + (f": {body_excerpt}" if body_excerpt else "")
+    )
+
+
 def _resolve_base_url(
     explicit_base_url: str | None,
     env_var_name: str,
@@ -69,10 +80,8 @@ def forecast_timeseries(
         )
         response.raise_for_status()
         return response.json()
-    except requests.HTTPError as exc:
-        raise RuntimeError(
-            "No available forecaster base URL candidates for /predict"
-        ) from exc
+    except requests.RequestException as exc:
+        raise RuntimeError(_http_error_message("/predict", exc)) from exc
 
 
 def agent_chat_stream(
@@ -119,10 +128,8 @@ def agent_chat_stream(
                     raise RuntimeError(
                         f"Invalid streaming payload from agent service: {exc}"
                     ) from exc
-    except requests.HTTPError as exc:
-        raise RuntimeError(
-            "No available agent base URL candidates for /chat/stream"
-        ) from exc
+    except requests.RequestException as exc:
+        raise RuntimeError(_http_error_message("/chat/stream", exc)) from exc
 
 
 def interpret_plot_image(
@@ -157,10 +164,8 @@ def interpret_plot_image(
         if isinstance(result, dict):
             return result
         return {"description": str(result), "mode": mode}
-    except requests.HTTPError as exc:
-        raise RuntimeError(
-            "No available agent base URL candidates for /plots/interpret"
-        ) from exc
+    except requests.RequestException as exc:
+        raise RuntimeError(_http_error_message("/plots/interpret", exc)) from exc
 
 
 def cluster_dataframe(
@@ -201,9 +206,7 @@ def cluster_dataframe(
         response.raise_for_status()
         return response.json()
     except requests.RequestException as exc:
-        raise RuntimeError(
-            "No available clustering base URL candidates for /cluster"
-        ) from exc
+        raise RuntimeError(_http_error_message("/cluster", exc)) from exc
 
 
 def list_agent_models(base_url: str | None = None) -> list[str]:
@@ -222,6 +225,6 @@ def list_agent_models(base_url: str | None = None) -> list[str]:
         if isinstance(payload, list):
             return [str(model) for model in payload if str(model).strip()]
     except requests.RequestException as exc:
-        raise RuntimeError(
-            "No available agent base URL candidates for /models"
-        ) from exc
+        raise RuntimeError(_http_error_message("/models", exc)) from exc
+
+    return []

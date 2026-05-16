@@ -1,3 +1,5 @@
+import logging
+
 import streamlit as st
 import yaml
 
@@ -9,6 +11,7 @@ from core.token_usage import (
     total_session_tokens,
 )
 
+logger = logging.getLogger(__name__)
 
 CONFIG_PATH = "config.yaml"
 with open(CONFIG_PATH) as f:
@@ -20,22 +23,21 @@ def _resolve_agent_base_url() -> str:
 
 
 def _read_shared_config() -> tuple[dict, str | None]:
-    try:
-        loaded = CONFIG
-        if isinstance(loaded, dict):
-            return loaded, CONFIG_PATH
-    except Exception:
-        pass
+    if isinstance(CONFIG, dict):
+        return CONFIG, CONFIG_PATH
     return {}, None
 
 
-def _write_shared_config(config_data: dict):
+def _write_shared_config(config_data: dict) -> str:
     try:
         with open(CONFIG_PATH, "w", encoding="utf-8") as file:
             yaml.safe_dump(config_data, file, sort_keys=False)
         return CONFIG_PATH
-    except Exception:
-        raise PermissionError("Could not write config.yaml from this runtime context.")
+    except OSError as exc:
+        logger.warning("Could not write %s: %s", CONFIG_PATH, exc)
+        raise PermissionError(
+            f"Could not write config.yaml from this runtime context: {exc}"
+        ) from exc
 
 
 log_page_render("System Settings")
@@ -53,8 +55,9 @@ available_models: list[str] = []
 models_error: str | None = None
 try:
     available_models = list_agent_models(agent_base_url)
-except Exception as exc:
+except RuntimeError as exc:
     models_error = str(exc)
+    logger.warning("Could not fetch agent models from %s: %s", agent_base_url, exc)
 
 if available_models:
     model_options = sorted(set(available_models))
@@ -91,7 +94,7 @@ if save_clicked:
             written_to = _write_shared_config(config_data)
             st.success(f"Saved model '{selected_model}' to {written_to}.")
             st.info("Restart the agent container/service to apply the new model.")
-        except Exception as exc:
+        except PermissionError as exc:
             st.error(f"Could not write config.yaml: {exc}")
 
 if loaded_from:

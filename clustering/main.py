@@ -2,6 +2,7 @@ import numpy as np
 import yaml
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from sklearn.cluster import DBSCAN, KMeans
 from sklearn.manifold import TSNE
 
@@ -127,8 +128,23 @@ def list_methods() -> dict[str, list[str]]:
     return {"available_methods": ["kmeans", "dbscan"]}
 
 
+def _run_clustering(
+    estimator: object,
+    feature_matrix: np.ndarray,
+    feature_columns: list[str],
+    random_state: int,
+) -> tuple[np.ndarray, np.ndarray, str, list[str]]:
+    labels = estimator.fit_predict(feature_matrix)
+    projection, projection_mode, projection_labels = _build_visual_projection(
+        feature_matrix=feature_matrix,
+        feature_columns=feature_columns,
+        random_state=random_state,
+    )
+    return labels, projection, projection_mode, projection_labels
+
+
 @app.post("/cluster", response_model=ClusterResponse)
-def cluster_dataframe(request: ClusterRequest) -> ClusterResponse:
+async def cluster_dataframe(request: ClusterRequest) -> ClusterResponse:
     rows = request.dataframe
     feature_matrix, feature_columns = _build_feature_matrix(
         rows, request.feature_columns
@@ -156,11 +172,12 @@ def cluster_dataframe(request: ClusterRequest) -> ClusterResponse:
         raise HTTPException(status_code=400, detail=f"Unknown method: {request.method}")
 
     try:
-        labels = estimator.fit_predict(feature_matrix)
-        projection, projection_mode, projection_labels = _build_visual_projection(
-            feature_matrix=feature_matrix,
-            feature_columns=feature_columns,
-            random_state=request.random_state,
+        labels, projection, projection_mode, projection_labels = await run_in_threadpool(
+            _run_clustering,
+            estimator,
+            feature_matrix,
+            feature_columns,
+            request.random_state,
         )
     except ValueError as e:
         raise HTTPException(

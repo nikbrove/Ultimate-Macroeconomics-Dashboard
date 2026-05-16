@@ -3,11 +3,11 @@ import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
 
+from core.page_helpers import fetch_indicator_slice
 from core.plotting import apply_plotly_theme
 from core.theming import get_color, get_colorway
 from core.postgres_client import (
     get_world_bank_country_mapping,
-    get_world_bank_indicator,
 )
 from pages.page_utils import render_page_from_config
 
@@ -25,31 +25,6 @@ MALE_POPULATION_INDICATOR_ID = "SP.POP.TOTL.MA.IN"
 FEMALE_POPULATION_INDICATOR_ID = "SP.POP.TOTL.FE.IN"
 
 
-def _prepare_indicator_slice(indicator_id: str, value_col: str) -> pl.DataFrame:
-    indicator_df = get_world_bank_indicator(indicator_id, country_code="ALL")
-    required_cols = {"year", "economy", "value"}
-    if indicator_df.is_empty() or not required_cols.issubset(set(indicator_df.columns)):
-        return pl.DataFrame()
-
-    return (
-        indicator_df.select(
-            [
-                pl.col("year").cast(pl.Int64, strict=False).alias("year"),
-                pl.col("economy").cast(pl.Utf8).str.to_uppercase().alias("economy"),
-                pl.col("value").cast(pl.Float64, strict=False).alias(value_col),
-            ]
-        )
-        .filter(
-            pl.col("year").is_not_null()
-            & pl.col("economy").is_not_null()
-            & pl.col(value_col).is_not_null()
-        )
-        .group_by(["year", "economy"])
-        .agg(pl.col(value_col).mean().alias(value_col))
-        .sort(["year", "economy"])
-    )
-
-
 def _render_demography_bubble() -> None:
     st.subheader("Population Bubble Explorer")
     st.caption(
@@ -57,23 +32,23 @@ def _render_demography_bubble() -> None:
         "labor force, and male/female population totals."
     )
 
-    total_population_df = _prepare_indicator_slice(
+    total_population_df = fetch_indicator_slice(
         POPULATION_INDICATOR_ID,
         value_col="total_population",
     )
-    population_growth_df = _prepare_indicator_slice(
+    population_growth_df = fetch_indicator_slice(
         POPULATION_GROWTH_INDICATOR_ID,
         value_col="population_growth",
     )
-    labor_force_df = _prepare_indicator_slice(
+    labor_force_df = fetch_indicator_slice(
         LABOR_FORCE_INDICATOR_ID,
         value_col="labor_force",
     )
-    male_population_df = _prepare_indicator_slice(
+    male_population_df = fetch_indicator_slice(
         MALE_POPULATION_INDICATOR_ID,
         value_col="male_population",
     )
-    female_population_df = _prepare_indicator_slice(
+    female_population_df = fetch_indicator_slice(
         FEMALE_POPULATION_INDICATOR_ID,
         value_col="female_population",
     )
@@ -181,9 +156,9 @@ def _render_age_structure_deep_dive() -> None:
         "available year. Selected countries are highlighted and labelled."
     )
 
-    young = _prepare_indicator_slice(AGE_0_14_INDICATOR_ID, value_col="young")
-    working = _prepare_indicator_slice(AGE_15_64_INDICATOR_ID, value_col="working")
-    elderly = _prepare_indicator_slice(AGE_65_INDICATOR_ID, value_col="elderly")
+    young = fetch_indicator_slice(AGE_0_14_INDICATOR_ID, value_col="young")
+    working = fetch_indicator_slice(AGE_15_64_INDICATOR_ID, value_col="working")
+    elderly = fetch_indicator_slice(AGE_65_INDICATOR_ID, value_col="elderly")
 
     if young.is_empty() or working.is_empty() or elderly.is_empty():
         st.info("Age structure ternary is unavailable - source data missing.")

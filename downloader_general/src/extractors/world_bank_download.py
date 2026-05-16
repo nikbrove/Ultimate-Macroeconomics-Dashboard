@@ -53,9 +53,9 @@ class WorldBankDownloader(BaseWorldBankDownloader):
 
         self.database_schema = database_schema or {}
 
-        self.successfull_connections = False
         self.download_max_retries = 3
         self.download_retry_delay_seconds = 5
+        self.between_download_sleep_seconds = 10
 
     def _table_def(self, table_name: str) -> Dict[str, Any]:
         return get_table_definition(self.database_schema, self.SCHEMA_GROUP, table_name)
@@ -75,9 +75,7 @@ class WorldBankDownloader(BaseWorldBankDownloader):
             self.sql_uri = None
             logger.warning("Connection test to SQL database failed")
         _world_bank_test = _test_world_bank_api()
-        result = _sql_test and _world_bank_test
-        self.successfull_connections = result
-        return result
+        return _sql_test and _world_bank_test
 
     def _fetch_indicator_data_via_api(self, indicator_id: str, db: int) -> Optional[list]:
         """Fallback for sources where wbgapi's /sources/{db}/series/... URL returns empty JSON.
@@ -261,7 +259,7 @@ class WorldBankDownloader(BaseWorldBankDownloader):
         logger.info(
             f"Finished download of World Bank indicator data (indicator_id={indicator_id}, db={db})"
         )
-        sleep(10)
+        sleep(self.between_download_sleep_seconds)
 
     def download_metadata(self, indicator_id: str, db: int) -> None:
         logger.info(
@@ -319,7 +317,7 @@ class WorldBankDownloader(BaseWorldBankDownloader):
         logger.info(
             f"Finished download of World Bank indicator metadata (indicator_id={indicator_id}, db={db})"
         )
-        sleep(10)
+        sleep(self.between_download_sleep_seconds)
 
     def run(self) -> None:
         bootstrap_schema_group(self.sql_uri, self.database_schema, self.SCHEMA_GROUP)

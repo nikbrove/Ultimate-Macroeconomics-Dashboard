@@ -3,12 +3,12 @@ import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
 
+from core.page_helpers import fetch_indicator_slice
 from core.plotting import apply_plotly_theme
 from core.theming import get_color, get_colorway
 from core.postgres_client import (
     get_world_bank_country_mapping,
     get_world_bank_country_regions,
-    get_world_bank_indicator,
 )
 from pages.page_utils import render_page_from_config
 
@@ -16,30 +16,6 @@ from pages.page_utils import render_page_from_config
 PAGE_TITLE = "Environment and Sustainability"
 RENEWABLE_INDICATOR_ID = "EG.FEC.RNEW.ZS"
 PM25_INDICATOR_ID = "EN.ATM.PM25.MC.M3"
-
-
-def _prepare_indicator_slice(df: pl.DataFrame, value_col: str) -> pl.DataFrame:
-    required_cols = {"year", "economy", "value"}
-    if df.is_empty() or not required_cols.issubset(set(df.columns)):
-        return pl.DataFrame()
-
-    return (
-        df.select(
-            [
-                pl.col("year").cast(pl.Int64, strict=False).alias("year"),
-                pl.col("economy").cast(pl.Utf8).str.to_uppercase().alias("economy"),
-                pl.col("value").cast(pl.Float64, strict=False).alias(value_col),
-            ]
-        )
-        .filter(
-            pl.col("year").is_not_null()
-            & pl.col("economy").is_not_null()
-            & pl.col(value_col).is_not_null()
-        )
-        .group_by(["year", "economy"])
-        .agg(pl.col(value_col).mean().alias(value_col))
-        .sort(["year", "economy"])
-    )
 
 
 def _render_renewable_vs_pm25_overview() -> None:
@@ -51,14 +27,8 @@ def _render_renewable_vs_pm25_overview() -> None:
         "relationship is noisy because of geography, density, and industry mix."
     )
 
-    renewable_df = _prepare_indicator_slice(
-        get_world_bank_indicator(RENEWABLE_INDICATOR_ID, country_code="ALL"),
-        value_col="renewable_pct",
-    )
-    pm25_df = _prepare_indicator_slice(
-        get_world_bank_indicator(PM25_INDICATOR_ID, country_code="ALL"),
-        value_col="pm25_ugm3",
-    )
+    renewable_df = fetch_indicator_slice(RENEWABLE_INDICATOR_ID, value_col="renewable_pct")
+    pm25_df = fetch_indicator_slice(PM25_INDICATOR_ID, value_col="pm25_ugm3")
 
     if renewable_df.is_empty() or pm25_df.is_empty():
         st.info(
@@ -192,18 +162,9 @@ def _render_kuznets_curve_deep_dive() -> None:
         "as economies decouple growth from emissions intensity."
     )
 
-    ghg_pc = _prepare_indicator_slice(
-        get_world_bank_indicator(GHG_PC_INDICATOR_ID, country_code="ALL"),
-        value_col="ghg_pc",
-    )
-    ghg_total = _prepare_indicator_slice(
-        get_world_bank_indicator(GHG_TOTAL_INDICATOR_ID, country_code="ALL"),
-        value_col="ghg_total",
-    )
-    gdp_pc = _prepare_indicator_slice(
-        get_world_bank_indicator(GDP_PC_INDICATOR_ID, country_code="ALL"),
-        value_col="gdp_pc",
-    )
+    ghg_pc = fetch_indicator_slice(GHG_PC_INDICATOR_ID, value_col="ghg_pc")
+    ghg_total = fetch_indicator_slice(GHG_TOTAL_INDICATOR_ID, value_col="ghg_total")
+    gdp_pc = fetch_indicator_slice(GDP_PC_INDICATOR_ID, value_col="gdp_pc")
     regions_df = get_world_bank_country_regions()
 
     if any(df.is_empty() for df in (ghg_pc, ghg_total, gdp_pc)) or regions_df.is_empty():

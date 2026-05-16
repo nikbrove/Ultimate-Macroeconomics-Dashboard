@@ -1,4 +1,5 @@
 import json
+import logging
 from typing import Any, Callable
 
 import streamlit as st
@@ -9,6 +10,8 @@ from core.postgres_client import (
     get_world_bank_country_codes,
     get_world_bank_country_mapping,
 )
+
+logger = logging.getLogger(__name__)
 
 INDICATOR_CONFIG = "_configs/world_bank_download_config.json"
 DEFAULT_COUNTRY_ALIASES = {
@@ -24,7 +27,8 @@ def _load_indicator_config() -> dict[str, list[dict[str, Any]]]:
     try:
         with open(INDICATOR_CONFIG, "r", encoding="utf-8") as file:
             loaded = json.load(file)
-    except Exception:
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Could not load %s: %s", INDICATOR_CONFIG, exc)
         return {}
 
     if isinstance(loaded, dict):

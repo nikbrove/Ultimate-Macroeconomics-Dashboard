@@ -1,12 +1,17 @@
+import asyncio
+import os
+from contextlib import asynccontextmanager
+
 import polars as pl
 import yaml
 
 from fastapi import FastAPI, HTTPException
+from fastapi.concurrency import run_in_threadpool
 
 from schemas import ForecastPoint, ForecastRequest, ForecastResponse
 from forecasters.core.base import BaseForecaster
 
-CONFIG_PATH = "config.yaml"
+CONFIG_PATH = os.environ.get("FORECASTER_CONFIG_PATH", "config.yaml")
 
 with open(CONFIG_PATH) as f:
     CONFIG = yaml.safe_load(f)
@@ -18,16 +23,27 @@ CHRONOS_AVAILABLE = bool(FORECASTER_CONFIG.get("CHRONOS_AVAILABLE"))
 CHRONOS_MODEL_NAME = FORECASTER_CONFIG.get("CHRONOS_MODEL")
 CHRONOS_DEFAULT_MODEL_NAME = "amazon/chronos-t5-small"
 
-_model_cache: dict[str, BaseForecaster] = {}
 
+async def _get_forecaster(app: FastAPI, model_type: str) -> BaseForecaster:
+    """Return a cached forecaster, lazily importing+constructing under a lock.
 
-def get_forecaster(
-    model_type: str,
-) -> BaseForecaster:
+    Without the lock, two concurrent first-time requests for the same model
+    would each import the heavy ML library (prophet, chronos…) and race on
+    the dict assignment. The lock makes initialization atomic across the
+    asyncio event loop. Heavy fit/predict still runs off-loop via
+    ``run_in_threadpool``.
+    """
+    cache: dict[str, BaseForecaster] = app.state.model_cache
+    lock: asyncio.Lock = app.state.model_cache_lock
+
     if model_type == "prophet":
         if not PROPHET_AVAILABLE:
             raise HTTPException(status_code=400, detail="Model 'prophet' is disabled.")
-        if "prophet" not in _model_cache:
+        if "prophet" in cache:
+            return cache["prophet"]
+        async with lock:
+            if "prophet" in cache:
+                return cache["prophet"]
             try:
                 from forecasters.prophet_model import ProphetForecaster
             except Exception as e:
@@ -35,12 +51,17 @@ def get_forecaster(
                     status_code=500,
                     detail=f"Failed to initialize Prophet forecaster: {str(e)}",
                 )
-            _model_cache["prophet"] = ProphetForecaster()
-        return _model_cache["prophet"]
-    elif model_type == "chronos":
+            cache["prophet"] = ProphetForecaster()
+            return cache["prophet"]
+
+    if model_type == "chronos":
         if not CHRONOS_AVAILABLE:
             raise HTTPException(status_code=400, detail="Model 'chronos' is disabled.")
-        if "chronos" not in _model_cache:
+        if "chronos" in cache:
+            return cache["chronos"]
+        async with lock:
+            if "chronos" in cache:
+                return cache["chronos"]
             try:
                 from forecasters.chronos_model import ChronosForecaster
             except Exception as e:
@@ -48,15 +69,21 @@ def get_forecaster(
                     status_code=500,
                     detail=f"Failed to initialize Chronos forecaster: {str(e)}",
                 )
-            if CHRONOS_MODEL_NAME:
-                _model_cache["chronos"] = ChronosForecaster(CHRONOS_MODEL_NAME)
-            else:
-                _model_cache["chronos"] = ChronosForecaster()
-        return _model_cache["chronos"]
-    elif model_type == "arima":
+            cache["chronos"] = (
+                ChronosForecaster(CHRONOS_MODEL_NAME)
+                if CHRONOS_MODEL_NAME
+                else ChronosForecaster()
+            )
+            return cache["chronos"]
+
+    if model_type == "arima":
         if not ARIMA_AVAILABLE:
             raise HTTPException(status_code=400, detail="Model 'arima' is disabled.")
-        if "arima" not in _model_cache:
+        if "arima" in cache:
+            return cache["arima"]
+        async with lock:
+            if "arima" in cache:
+                return cache["arima"]
             try:
                 from forecasters.arima_model import ArimaForecaster
             except Exception as e:
@@ -64,15 +91,23 @@ def get_forecaster(
                     status_code=500,
                     detail=f"Failed to initialize ARIMA forecaster: {str(e)}",
                 )
-            _model_cache["arima"] = ArimaForecaster()
-        return _model_cache["arima"]
-    else:
-        raise HTTPException(status_code=400, detail=f"Unknown model type: {model_type}")
+            cache["arima"] = ArimaForecaster()
+            return cache["arima"]
+
+    raise HTTPException(status_code=400, detail=f"Unknown model type: {model_type}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.model_cache = {}
+    app.state.model_cache_lock = asyncio.Lock()
+    yield
 
 
 app = FastAPI(
     title="Time Series Forecasting API",
     description="A unified API for Prophet, Chronos, and ARIMA forecasting.",
+    lifespan=lifespan,
 )
 
 
@@ -101,7 +136,7 @@ def list_models() -> dict[str, list[str]]:
 
 
 @app.post("/predict", response_model=ForecastResponse)
-def generate_prediction(request: ForecastRequest) -> ForecastResponse:
+async def generate_prediction(request: ForecastRequest) -> ForecastResponse:
     df = pl.DataFrame({"ds": request.dates, "y": request.values}).with_columns(
         pl.col("ds").str.to_datetime(strict=False)
     )
@@ -119,10 +154,11 @@ def generate_prediction(request: ForecastRequest) -> ForecastResponse:
     else:
         df_context = df
 
-    forecaster = get_forecaster(request.model_type)
+    forecaster = await _get_forecaster(app, request.model_type)
 
     try:
-        forecast_df = forecaster.predict(
+        forecast_df = await run_in_threadpool(
+            forecaster.predict,
             df=df_context,
             n_predict=request.n_predict,
             alpha=request.alpha,
