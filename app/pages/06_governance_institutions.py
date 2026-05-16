@@ -61,7 +61,7 @@ def _build_wgi_panel() -> pl.DataFrame:
 
 
 def _render_wgi_radar_overview() -> None:
-    st.subheader("Governance Profile (WGI Radar)")
+    st.subheader("Governance Radar")
     st.caption(
         "Compares World Governance Indicators across countries. Each axis is a "
         "governance dimension (range roughly -2.5 to +2.5; higher is better). "
@@ -163,7 +163,7 @@ def _render_wgi_radar_overview() -> None:
 
     value_min, value_max = -2.5, 2.5
     fig.update_layout(
-        title=f"Worldwide Governance Indicators ({selected_year})",
+        title=f"Governance Radar ({selected_year})",
         polar={
             "radialaxis": {
                 "visible": True,
@@ -193,7 +193,7 @@ HEATMAP_BOTTOM_N = 15
 
 def _render_wgi_heatmap_deep_dive() -> None:
     st.divider()
-    st.subheader("WGI Heatmap — leaders and laggards over time")
+    st.subheader("Governance Heatmap")
     st.caption(
         "Pick a governance dimension and see how it has evolved by country since "
         f"1996. Rows are the global top-{HEATMAP_TOP_N} and bottom-"
@@ -249,7 +249,7 @@ def _render_wgi_heatmap_deep_dive() -> None:
         row = rows_by_economy.get(econ)
         if row is None:
             continue
-        z.append([row.get(year) for year in years])
+        z.append([row.get(str(year)) for year in years])
         country_name = name_by_iso.get(econ, econ)
         y_labels.append(f"{country_name} ({econ})")
 
@@ -270,7 +270,7 @@ def _render_wgi_heatmap_deep_dive() -> None:
         )
     )
     fig.update_layout(
-        title=f"{selected_dim} — leaders and laggards",
+        title=f"{selected_dim}",
         xaxis_title="Year",
         yaxis_title="",
         height=max(450, 18 * len(y_labels) + 100),

@@ -42,7 +42,7 @@ def _prepare_indicator_slice(df: pl.DataFrame, value_col: str) -> pl.DataFrame:
 
 
 def _render_inflation_vs_rate_overview() -> None:
-    st.subheader("Inflation vs Real Interest Rate")
+    st.subheader("Inflation vs Real Rate")
     st.caption(
         "Compares CPI inflation against the real lending interest rate across "
         "countries. Quadrants separate monetary-policy stances: top-right "
@@ -145,7 +145,7 @@ def _render_inflation_vs_rate_overview() -> None:
             "real_rate_pct": "Real interest rate (%)",
             "country_group": "",
         },
-        title=f"Inflation vs Real Interest Rate ({selected_year})",
+        title=f"Inflation vs Real Rate ({selected_year})",
     )
 
     selected_df = plot_df[plot_df["country_group"] == "Selected"]
@@ -193,7 +193,7 @@ INFLATION_CLIP = 50.0
 
 def _render_inflation_heatmap_deep_dive() -> None:
     st.divider()
-    st.subheader("Inflation Heatmap — Top-30 economies × last 25 years")
+    st.subheader("Inflation Heatmap")
     st.caption(
         f"CPI inflation (%) for the {HEATMAP_TOP_N} most populous economies "
         f"over the last {HEATMAP_YEARS} years. Colour is clipped to "
@@ -265,7 +265,7 @@ def _render_inflation_heatmap_deep_dive() -> None:
         row = matrix_dict.get(econ)
         if row is None:
             continue
-        z.append([row.get(year) for year in years])
+        z.append([row.get(str(year)) for year in years])
         country_name = name_by_iso.get(econ, econ)
         marker = " ★" if econ in selected_iso_codes else ""
         y_labels.append(f"{country_name} ({econ}){marker}")
@@ -287,7 +287,7 @@ def _render_inflation_heatmap_deep_dive() -> None:
         )
     )
     fig.update_layout(
-        title=f"CPI inflation, {start_year} - {latest_inf_year}",
+        title=f"Inflation Heatmap ({start_year}–{latest_inf_year})",
         xaxis_title="Year",
         yaxis_title="",
         height=max(420, 22 * len(y_labels) + 100),
