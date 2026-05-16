@@ -23,7 +23,7 @@ Technical stack used in the application or during development (not exhaustive):
 
 
 ## Description
-[`Ultimate Macroeconomics Dashboard`](https://github.com/alexveider1/Ultimate-Macroeconomics-Dashboard) is an AI-powered analytical system for macroeconomic data, packaged as an interactive multi-page dashboard. It combines more than **60** indicators from the [`World Bank Data API`](https://data360.worldbank.org/en/search), more than **30 000** news articles from the open [`Webz.io`](https://github.com/Webhose/free-news-datasets) repository, and more than **50** companies and **9** indices from [`Yahoo Finance`](https://finance.yahoo.com/). The UI is built on `streamlit` and `plotly` and ships with **60+** ready-made interactive plots, a multi-agent AI analyst, semantic search over news (RAG), time-series forecasting, and unsupervised clustering.
+[`Ultimate Macroeconomics Dashboard`](https://github.com/alexveider1/Ultimate-Macroeconomics-Dashboard) is an AI-powered analytical system for macroeconomic data, packaged as an interactive multi-page dashboard. It combines more than **70** indicators from the [`World Bank Data API`](https://data360.worldbank.org/en/search), more than **30 000** news articles from the open [`Webz.io`](https://github.com/Webhose/free-news-datasets) repository, and more than **50** companies and **9** indices from [`Yahoo Finance`](https://finance.yahoo.com/). The UI is built on `streamlit` and `plotly` and ships with **80+** ready-made interactive plots, a multi-agent AI analyst, semantic search over news (RAG), time-series forecasting, and unsupervised clustering.
 
 The project follows a strict micro-service design and is composed of 10 `Docker` containers, each responsible for one capability:
 
