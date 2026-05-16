@@ -2,7 +2,6 @@ import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
 
-from core.app_logging import log_page_render
 from core.plotting import apply_plotly_theme
 from core.theming import get_color
 from core.postgres_client import (

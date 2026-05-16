@@ -161,7 +161,7 @@ def _render_demography_bubble() -> None:
     fig.update_traces(
         marker={
             "opacity": 0.78,
-            "line": {"width": 0.5, "color": "rgba(255, 255, 255, 0.7)"},
+            "line": {"width": 0.5},
         }
     )
     fig.update_layout(showlegend=False)

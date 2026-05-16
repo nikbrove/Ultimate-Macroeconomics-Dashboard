@@ -7,7 +7,6 @@ from core.assets import get_markup_template, render_markup_template
 from core.plotting import apply_plotly_theme
 from core.theming import get_color
 from core.postgres_client import (
-    get_world_bank_country_codes,
     get_world_bank_country_mapping,
     get_world_bank_country_regions,
     get_world_bank_indicator,
