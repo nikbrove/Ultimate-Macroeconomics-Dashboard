@@ -8,7 +8,7 @@ import streamlit as st
 from core.assets import get_markup_template
 from core.app_logging import log_page_render
 from core.plotting import apply_plotly_theme, build_line_plot
-from core.theming import get_color
+from core.theming import get_color, get_diverging_colorscale
 from core.postgres_client import get_all_yahoo_historical_prices, get_all_yahoo_metadata
 
 
@@ -202,7 +202,7 @@ def build_yahoo_correlation_heatmap(
             zmin=-1,
             zmax=1,
             zmid=0,
-            colorscale="RdBu",
+            colorscale=get_diverging_colorscale(),
             colorbar_title="Corr",
             hovertemplate=get_markup_template("correlation_heatmap_hovertemplate"),
         )

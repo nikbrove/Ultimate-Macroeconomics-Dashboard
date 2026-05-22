@@ -1,4 +1,5 @@
 import logging
+from pathlib import Path
 
 import streamlit as st
 import yaml
@@ -13,25 +14,25 @@ from core.token_usage import (
 
 logger = logging.getLogger(__name__)
 
-CONFIG_PATH = "config.yaml"
-with open(CONFIG_PATH) as f:
-    CONFIG = yaml.safe_load(f)
+CONFIG_PATH = Path("config.yaml")
+CONFIG = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
 
 
 def _resolve_agent_base_url() -> str:
     return resolve_agent_base_url()
 
 
-def _read_shared_config() -> tuple[dict, str | None]:
+def _read_shared_config() -> tuple[dict, Path | None]:
     if isinstance(CONFIG, dict):
         return CONFIG, CONFIG_PATH
     return {}, None
 
 
-def _write_shared_config(config_data: dict) -> str:
+def _write_shared_config(config_data: dict) -> Path:
     try:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as file:
-            yaml.safe_dump(config_data, file, sort_keys=False)
+        CONFIG_PATH.write_text(
+            yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8"
+        )
         return CONFIG_PATH
     except OSError as exc:
         logger.warning("Could not write %s: %s", CONFIG_PATH, exc)

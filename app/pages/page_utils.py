@@ -1,5 +1,6 @@
 import json
 import logging
+from pathlib import Path
 from typing import Any, Callable
 
 import streamlit as st
@@ -13,7 +14,7 @@ from core.postgres_client import (
 
 logger = logging.getLogger(__name__)
 
-INDICATOR_CONFIG = "_configs/world_bank_download_config.json"
+INDICATOR_CONFIG = Path("_configs/world_bank_download_config.json")
 DEFAULT_COUNTRY_ALIASES = {
     "USA": "United States",
     "CHN": "China",
@@ -25,8 +26,7 @@ MAX_COUNTRY_SELECTION = 10
 @st.cache_data(show_spinner=False)
 def _load_indicator_config() -> dict[str, list[dict[str, Any]]]:
     try:
-        with open(INDICATOR_CONFIG, "r", encoding="utf-8") as file:
-            loaded = json.load(file)
+        loaded = json.loads(INDICATOR_CONFIG.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         logger.warning("Could not load %s: %s", INDICATOR_CONFIG, exc)
         return {}

@@ -1,6 +1,7 @@
 import asyncio
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import polars as pl
 import yaml
@@ -11,10 +12,9 @@ from fastapi.concurrency import run_in_threadpool
 from schemas import ForecastPoint, ForecastRequest, ForecastResponse
 from forecasters.core.base import BaseForecaster
 
-CONFIG_PATH = os.environ.get("FORECASTER_CONFIG_PATH", "config.yaml")
+CONFIG_PATH = Path(os.environ.get("FORECASTER_CONFIG_PATH", "config.yaml"))
 
-with open(CONFIG_PATH) as f:
-    CONFIG = yaml.safe_load(f)
+CONFIG = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
 FORECASTER_CONFIG = CONFIG.get("forecaster", {})
 
 ARIMA_AVAILABLE = bool(FORECASTER_CONFIG.get("ARIMA_AVAILABLE"))

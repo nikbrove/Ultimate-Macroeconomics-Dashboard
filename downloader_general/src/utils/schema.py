@@ -1,4 +1,5 @@
 import logging
+from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import polars as pl
@@ -41,9 +42,8 @@ _SQL_TO_POLARS = {
 }
 
 
-def load_database_schema(path: str) -> Dict[str, Any]:
-    with open(path) as fh:
-        return yaml.safe_load(fh)
+def load_database_schema(path: str | Path) -> Dict[str, Any]:
+    return yaml.safe_load(Path(path).read_text(encoding="utf-8"))
 
 
 def get_table_definition(

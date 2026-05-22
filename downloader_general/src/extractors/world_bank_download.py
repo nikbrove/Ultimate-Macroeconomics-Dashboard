@@ -1,14 +1,15 @@
 import os
 import sys
 import logging
-import requests
-import polars as pl
-import wbgapi as wb
-
+from pathlib import Path
 from time import sleep
 from typing import Any, Dict, Optional
-from tqdm import tqdm
+
+import polars as pl
+import requests
+import wbgapi as wb
 from dotenv import load_dotenv
+from tqdm import tqdm
 
 from src.utils.downloads import (
     _get_sql_config,
@@ -37,11 +38,11 @@ class WorldBankDownloader(BaseWorldBankDownloader):
 
     def __init__(
         self,
-        env_path: str,
-        download_config_path: str | None = None,
+        env_path: str | Path,
+        download_config_path: str | Path | None = None,
         database_schema: Optional[Dict[str, Any]] = None,
     ) -> None:
-        self.env_path = env_path
+        self.env_path = Path(env_path)
         self.download_config = _download_config(download_config_path)
         self.sql_uri = None
 

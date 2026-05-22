@@ -1,8 +1,8 @@
 import logging
-import os
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 import yaml
 from dotenv import load_dotenv
@@ -20,11 +20,10 @@ logger = logging.getLogger(__name__)
 SANDBOX_MEMORY_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
 SANDBOX_CPU_TIME_BUFFER_SECONDS = 5
 
-CONFIG_PATH = "config.yaml"
-ENV_FILE_PATH = ".env"
+CONFIG_PATH = Path("config.yaml")
+ENV_FILE_PATH = Path(".env")
 
-with open(CONFIG_PATH) as f:
-    CONFIG = yaml.safe_load(f)
+CONFIG = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
 load_dotenv(ENV_FILE_PATH)
 
 app = FastAPI(
@@ -71,7 +70,7 @@ def _build_preexec(timeout_seconds: int):
 def _run_code(code: str, timeout_seconds: int) -> ExecutionResult:
     with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as temp_file:
         temp_file.write(code)
-        temp_file_path = temp_file.name
+        temp_file_path = Path(temp_file.name)
 
     logger.info(
         "sandbox: starting subprocess (timeout=%ss, code_bytes=%d)",
@@ -80,7 +79,7 @@ def _run_code(code: str, timeout_seconds: int) -> ExecutionResult:
     )
     try:
         result = subprocess.run(
-            [sys.executable, temp_file_path],
+            [sys.executable, str(temp_file_path)],
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
@@ -116,7 +115,7 @@ def _run_code(code: str, timeout_seconds: int) -> ExecutionResult:
         )
     finally:
         try:
-            os.remove(temp_file_path)
+            temp_file_path.unlink()
         except OSError as exc:
             logger.warning("sandbox: could not remove temp file %s: %s", temp_file_path, exc)
 

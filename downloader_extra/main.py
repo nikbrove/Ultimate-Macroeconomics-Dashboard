@@ -1,5 +1,6 @@
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import yaml
 from fastapi import FastAPI, HTTPException
@@ -12,11 +13,10 @@ from schema import Base, IngestRequest, IngestResponse
 from client_wb import fetch_and_store_indicator
 
 
-CONFIG_PATH = "config.yaml"
-ENV_FILE_PATH = ".env"
+CONFIG_PATH = Path("config.yaml")
+ENV_FILE_PATH = Path(".env")
 
-with open(CONFIG_PATH) as f:
-    CONFIG = yaml.safe_load(f)
+CONFIG = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
 load_dotenv(ENV_FILE_PATH)
 
 _PG = CONFIG.get("postgres", {})

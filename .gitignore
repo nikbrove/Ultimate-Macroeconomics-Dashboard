@@ -2,6 +2,8 @@ __pycache__/
 .cache/
 venv/
 venv*/
+.venv/
+.venv*/
 test/
 test*/
 

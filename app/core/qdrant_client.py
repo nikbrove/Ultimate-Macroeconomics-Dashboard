@@ -1,5 +1,6 @@
 import logging
 import os
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 import yaml
@@ -9,11 +10,10 @@ from qdrant_client.http import models
 
 from core.app_logging import log_vector_query
 
-CONFIG_PATH = "config.yaml"
-ENV_FILE_PATH = ".env"
+CONFIG_PATH = Path("config.yaml")
+ENV_FILE_PATH = Path(".env")
 
-with open(CONFIG_PATH) as f:
-    CONFIG = yaml.safe_load(f)
+CONFIG = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
 load_dotenv(ENV_FILE_PATH)
 
 logger = logging.getLogger(__name__)

@@ -43,8 +43,7 @@ def _resolve_themes_path() -> Path:
 @st.cache_data(show_spinner=False)
 def load_themes() -> dict:
     path = _resolve_themes_path()
-    with open(path, "r", encoding="utf-8") as fh:
-        data = yaml.safe_load(fh)
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or "themes" not in data or "active" not in data:
         raise ValueError(
             f"{path} must contain top-level 'active' and 'themes' keys."
@@ -79,6 +78,20 @@ def get_color(token: str) -> str:
 
 def get_colorway() -> list[str]:
     return list(get_active_theme().get("plotly", {}).get("colorway") or [])
+
+
+def get_diverging_colorscale(reverse: bool = False) -> list[list[float | str]]:
+    """Return a 3-stop diverging Plotly colorscale from the active theme.
+
+    ``reverse=True`` swaps low/high (e.g. for inflation, where higher is "bad"
+    and should map to the negative-coded color).
+    """
+    low = get_color("diverging_low")
+    mid = get_color("diverging_mid")
+    high = get_color("diverging_high")
+    if reverse:
+        low, high = high, low
+    return [[0.0, low], [0.5, mid], [1.0, high]]
 
 
 def register_plotly_template() -> None:

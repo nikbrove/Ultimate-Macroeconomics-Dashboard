@@ -1,6 +1,7 @@
 import os
 import sys
 import stat
+from pathlib import Path
 
 from tqdm import tqdm
 from git import RemoteProgress
@@ -151,10 +152,9 @@ def _download_source_indicators(
     return True
 
 
-def _download_config(path: str) -> dict:
+def _download_config(path: str | Path) -> dict:
     """Download config for downloads"""
-    with open(path) as f:
-        return json.load(f)
+    return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
 def _get_sql_config(username: str, password: str, host: str, port: int, db: str) -> str:

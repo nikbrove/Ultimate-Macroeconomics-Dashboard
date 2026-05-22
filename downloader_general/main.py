@@ -1,7 +1,8 @@
 import sys
 import yaml
 import logging
-import os
+from pathlib import Path
+
 import tqdm
 
 from src.extractors import WorldBankDownloader, NewsDownloader, YahooDownloader
@@ -18,7 +19,7 @@ class _TqdmHandler(logging.StreamHandler):
             self.handleError(record)
 
 
-CONFIG_PATH = "config.yaml"
+CONFIG_PATH = Path("config.yaml")
 
 
 def _require(mapping: dict, *path: str) -> object:
@@ -35,18 +36,18 @@ def _require(mapping: dict, *path: str) -> object:
 
 def main() -> None:
     """Main function to run the downloaders."""
-    container_data_dir = os.path.join("_container_data")
-    news_output_dir = os.path.join(container_data_dir, "news")
+    container_data_dir = Path("_container_data")
+    news_output_dir = container_data_dir / "news"
 
-    os.makedirs(container_data_dir, exist_ok=True)
-    os.makedirs(news_output_dir, exist_ok=True)
+    container_data_dir.mkdir(parents=True, exist_ok=True)
+    news_output_dir.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         handlers=[
             logging.FileHandler(
-                os.path.join(container_data_dir, "app.log"),
+                container_data_dir / "app.log",
                 mode="w",
                 encoding="utf-8",
             ),
@@ -54,8 +55,7 @@ def main() -> None:
         ],
     )
 
-    with open(CONFIG_PATH) as f:
-        args = yaml.safe_load(f)
+    args = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
 
     env_file = _require(args, "shared", "env_file")
     postgres_host = _require(args, "postgres", "host")

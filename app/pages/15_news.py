@@ -15,6 +15,7 @@ from core.qdrant_client import (
     list_collections,
     scroll_collection,
 )
+from core.theming import get_color
 
 
 PAGE_TITLE = "News Explorer"
@@ -246,7 +247,8 @@ def _build_wordcloud_image(topic_corpus: str) -> Any:
             WordCloud(
                 width=WORD_CLOUD_WIDTH,
                 height=WORD_CLOUD_HEIGHT,
-                background_color="white",
+                background_color=get_color("wordcloud_background"),
+                colormap=get_color("wordcloud_colormap"),
                 collocations=False,
                 max_words=WORD_CLOUD_MAX_WORDS,
             )
@@ -268,8 +270,11 @@ def _render_topic_wordcloud(topic_corpus: str, source_count: int) -> None:
             st.info("No article texts were found for this topic.")
             return
 
+        background = get_color("wordcloud_background")
         with MATPLOTLIB_LOCK:
             fig, ax = plt.subplots(figsize=(12, 6), dpi=600)
+            fig.patch.set_facecolor(background)
+            ax.set_facecolor(background)
             ax.imshow(image_array, interpolation="bilinear")
             ax.axis("off")
             fig.tight_layout(pad=0)

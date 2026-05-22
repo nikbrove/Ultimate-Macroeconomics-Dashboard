@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 import yaml
 from dotenv import load_dotenv
@@ -8,11 +10,10 @@ from sklearn.manifold import TSNE
 
 from schemas import ClusterRequest, ClusterResponse
 
-CONFIG_PATH = "config.yaml"
-ENV_FILE_PATH = ".env"
+CONFIG_PATH = Path("config.yaml")
+ENV_FILE_PATH = Path(".env")
 
-with open(CONFIG_PATH) as f:
-    CONFIG = yaml.safe_load(f)
+CONFIG = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
 load_dotenv(ENV_FILE_PATH)
 
 VIZ_X_COL = "__viz_x"

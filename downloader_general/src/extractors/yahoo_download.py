@@ -1,6 +1,14 @@
+import logging
+import os
 import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, Iterable, Optional
+
 import polars as pl
 import yfinance as yf
+from dotenv import load_dotenv
+from tqdm import tqdm
 
 from src.core.base_downloaders import BaseYahooDownloader
 from src.utils.downloads import (
@@ -15,15 +23,6 @@ from src.utils.schema import (
     write_polars_to_table,
 )
 
-
-import os
-import time
-import logging
-
-from typing import Any, Dict, Iterable, Optional
-from dotenv import load_dotenv
-from tqdm import tqdm
-
 logger = logging.getLogger(__name__)
 
 
@@ -36,11 +35,11 @@ class YahooDownloader(BaseYahooDownloader):
 
     def __init__(
         self,
-        env_path: str,
-        download_config_path: str,
+        env_path: str | Path,
+        download_config_path: str | Path,
         database_schema: Optional[Dict[str, Any]] = None,
     ):
-        self.env_path = env_path
+        self.env_path = Path(env_path)
         self.download_config = _download_config(download_config_path)
         self.sql_uri = None
 

@@ -4,7 +4,6 @@
 
 ## Short-term
 * Add consistent across countries selector for countries
-* Fix "Map" -> "map" when applying log-transformation
 
 ## Medium-term
 * Complete complex testing of agent (create a table with set of tasks to solve and results of agent execution)

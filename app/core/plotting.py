@@ -6,6 +6,7 @@ import base64
 import hashlib
 import yaml
 import json
+from pathlib import Path
 from plotly.colors import hex_to_rgb
 from typing import Optional, Dict, Any
 from datetime import datetime
@@ -24,10 +25,9 @@ from core.postgres_client import (
 )
 from core.theming import PLOTLY_TEMPLATE_NAME, get_color, get_colorway
 
-CONFIG_PATH = "config.yaml"
+CONFIG_PATH = Path("config.yaml")
 
-with open(CONFIG_PATH) as f:
-    CONFIG = yaml.safe_load(f)
+CONFIG = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
 FORECASTER_BASE_URL = (
     f"http://forecaster:{CONFIG.get('forecaster', {}).get('port', 8001)}"
 )
@@ -1078,7 +1078,7 @@ class GraphBox:
                 map_df, dropped_map_points = self._apply_log_to_columns(
                     map_df, [schema["y"]]
                 )
-                map_title = "map (ln)"
+                map_title = "Map (ln)"
                 map_value_label = "ln(Value)"
 
             map_fig = build_map_plot(

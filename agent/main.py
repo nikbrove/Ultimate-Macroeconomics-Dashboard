@@ -3,12 +3,13 @@ import json
 import logging
 import os
 from functools import lru_cache
+from pathlib import Path
 
+import yaml
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from openai import OpenAI, OpenAIError
 from starlette.responses import StreamingResponse
-import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -24,14 +25,12 @@ from agent.schemas import (
 from agent.tools import configure_runtime
 from agent.usage import UsageTracker
 
+CONFIG_PATH = Path("config.yaml")
+ENV_FILE_PATH = Path(".env")
+DATABASE_SCHEMA_PATH = Path("database_schema.yaml")
+NEWS_TOPICS_PATH = Path("_configs/news_download_config.json")
 
-CONFIG_PATH = "config.yaml"
-ENV_FILE_PATH = ".env"
-DATABASE_SCHEMA_PATH = "database_schema.yaml"
-NEWS_TOPICS_PATH = "_configs/news_download_config.json"
-
-with open(CONFIG_PATH) as f:
-    CONFIG = yaml.safe_load(f)
+CONFIG = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
 
 load_dotenv(dotenv_path=ENV_FILE_PATH)
 
@@ -153,7 +152,9 @@ async def process_chat_stream(request: ChatRequest):
                             "answer": str(event.get("response", "")),
                             "model": AGENT_MODEL or "",
                             "artifacts": event.get("artifacts", {}),
-                            "usage": usage_tracker.snapshot(default_model=AGENT_MODEL or ""),
+                            "usage": usage_tracker.snapshot(
+                                default_model=AGENT_MODEL or ""
+                            ),
                         }
                     elif event_type == "error":
                         payload = {
@@ -165,7 +166,8 @@ async def process_chat_stream(request: ChatRequest):
                     yield f"data: {json.dumps(payload, default=str)}\n\n"
         except asyncio.TimeoutError:
             logger.warning(
-                "/chat/stream: agent stream exceeded %ss timeout", STREAM_TIMEOUT_SECONDS
+                "/chat/stream: agent stream exceeded %ss timeout",
+                STREAM_TIMEOUT_SECONDS,
             )
             timeout_payload = {
                 "type": "error",

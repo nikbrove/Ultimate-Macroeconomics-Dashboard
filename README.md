@@ -21,8 +21,8 @@ Technical stack used in the application or during development (not exhaustive):
 ![Qdrant](https://img.shields.io/badge/qdrant-%23dc2626.svg?style=for-the-badge&logo=qdrant&logoColor=white)
 ![DuckDuckGo](https://img.shields.io/badge/duckduckgo-de5833?style=for-the-badge&logo=duckduckgo&logoColor=white)
 
-
 ## Description
+
 [`Ultimate Macroeconomics Dashboard`](https://github.com/alexveider1/Ultimate-Macroeconomics-Dashboard) is an AI-powered analytical system for macroeconomic data, packaged as an interactive multi-page dashboard. It combines more than **70** indicators from the [`World Bank Data API`](https://data360.worldbank.org/en/search), more than **30 000** news articles from the open [`Webz.io`](https://github.com/Webhose/free-news-datasets) repository, and more than **50** companies and **9** indices from [`Yahoo Finance`](https://finance.yahoo.com/). The UI is built on `streamlit` and `plotly` and ships with **80+** ready-made interactive plots, a multi-agent AI analyst, semantic search over news (RAG), time-series forecasting, and unsupervised clustering.
 
 The project follows a strict micro-service design and is composed of 10 `Docker` containers, each responsible for one capability:
@@ -50,6 +50,7 @@ The project follows a strict micro-service design and is composed of 10 `Docker`
 | ![](app/assets/8.png)         | ![](app/assets/9.png)            |
 
 ## LLM Requirements
+
 The dashboard relies heavily on agentic infrastructure, so the LLM you connect must satisfy a specific feature set. These requirements are met by virtually every recent flagship model from major providers (`OpenAI`, `Google`, `Anthropic`, `Qwen`, `DeepSeek`). Older models or models from smaller providers may break some functionality. Powerful cloud models from paid APIs are recommended; local models served via [`vLLM`](https://github.com/vllm-project/vllm) on a high-performance GPU also work.
 
 * Reasoning capability.
@@ -58,8 +59,6 @@ The dashboard relies heavily on agentic infrastructure, so the LLM you connect m
 * Long context: $\geq 256\text{k}$ tokens (the application has been tested on `gpt-5.4` with a 1M-token context).
 
 ## Getting started
-
-This is the **local development** flow on the `main` branch. For a hardened, public-facing VPS deployment use the `hosting` branch — see [Deployment (hosting)](#deployment-hosting) below.
 
 `Ultimate Macroeconomics Dashboard` requires only `Docker` (with the Compose plugin) on the host.
 
@@ -248,8 +247,6 @@ address = "0.0.0.0"
 
 Setting `headless = true` is also recommended.
 
-For a real public deployment use the [Deployment (hosting)](#deployment-hosting) flow — that variant adds an Nginx reverse proxy, removes published backend ports, and accepts the LLM credentials from the user at runtime instead of the operator's `.env`.
-
 ### Adding extra indicators
 
 To add more World Bank indicators to the dashboard, append them to `_container_data/_configs/world_bank_download_config.json`. Each top-level key is one dashboard page:
@@ -274,44 +271,6 @@ To add more World Bank indicators to the dashboard, append them to `_container_d
 ```
 
 `downloader_general` will pick the new entries up on the next clean boot. Already-running stacks can fetch new indicators on demand via the AI analyst (which delegates to `downloader_extra`).
-
-## Deployment (hosting)
-
-The `main` branch is intended for local development and assumes the operator trusts everyone with access to the host. For a production deployment on a public VPS, switch to the `hosting` branch, which adds:
-
-* an `nginx` reverse-proxy container — the **only** container that publishes a host port (`80`);
-* an internal-only Docker network for all backend services (no host port mappings on `agent`, `forecaster`, `db`, `vector_db`, ...);
-* a per-session LLM credential form — the operator never holds the chat / agentic LLM key, the end user fills it on first visit and it lives only in `st.session_state` for the lifetime of that browser tab;
-* server-side credentials are limited to embedding / RAG and infrastructure secrets.
-
-> The `hosting` branch is created at v0.6. See `CHANGELOG.md` for the deployment-related changes.
-
-A typical Ubuntu VPS bring-up looks like:
-
-```bash
-# 1. Install Docker + Compose plugin
-sudo apt update
-sudo apt install -y docker.io docker-compose-plugin
-sudo systemctl enable --now docker
-
-# 2. Open port 80 (and 22 for SSH)
-sudo ufw allow 22/tcp
-sudo ufw allow 80/tcp
-sudo ufw enable
-
-# 3. Clone the hosting branch
-git clone --branch hosting https://github.com/alexveider1/Ultimate-Macroeconomics-Dashboard
-cd Ultimate-Macroeconomics-Dashboard/
-
-# 4. Fill _container_data/.env (Postgres, Qdrant, embedding key only)
-cp _container_data/.env.example _container_data/.env
-nano _container_data/.env
-
-# 5. Bring the stack up
-docker compose up -d --build
-```
-
-Then browse to `http://<vps-ip>/`. On first visit the dashboard prompts for the LLM base URL, API key, and (optionally) model — these are session-local and never written to disk.
 
 ## Correctness of data
 

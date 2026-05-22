@@ -25,6 +25,8 @@ import json
 import logging
 import warnings
 import shutil
+from pathlib import Path
+
 import requests
 from urllib.parse import urlparse
 
@@ -38,22 +40,22 @@ class NewsDownloader(BaseNewsDownloader):
 
     def __init__(
         self,
-        env_file: str,
+        env_file: str | Path,
         repo_url: str,
-        save_path: str,
+        save_path: str | Path,
         qdrant_host: str,
         qdrant_port: str,
-        config_path: str,
+        config_path: str | Path,
         openai_base_url: str | None = None,
         openai_embedding_model: str = "openai/text-embedding-3-small",
         openai_token_limit: int = 8192,
         openai_model_dimensions: int = 1536,
     ) -> None:
-        self.env_path = env_file
+        self.env_path = Path(env_file)
         self.github_api_url = "https://api.github.com"
 
         self.repo_url = repo_url
-        self.save_path = save_path
+        self.save_path = Path(save_path)
 
         self.is_downloaded = False
         self.is_parsed = False
@@ -116,9 +118,8 @@ class NewsDownloader(BaseNewsDownloader):
             )
             return False
         if response.status_code == 200 and bool(collections_response):
-            parent_dir = os.path.dirname(os.path.abspath(self.save_path))
-            if parent_dir:
-                os.makedirs(parent_dir, exist_ok=True)
+            parent_dir = self.save_path.resolve().parent
+            parent_dir.mkdir(parents=True, exist_ok=True)
             return True
         else:
             return False
@@ -170,22 +171,21 @@ class NewsDownloader(BaseNewsDownloader):
 
     def download_repository(self) -> bool:
         repo_url = self.repo_url
-        os.makedirs(self.save_path, exist_ok=True)
+        self.save_path.mkdir(parents=True, exist_ok=True)
 
-        for item_name in os.listdir(self.save_path):
-            item_path = os.path.join(self.save_path, item_name)
-            if os.path.isdir(item_path):
+        for item_path in self.save_path.iterdir():
+            if item_path.is_dir():
                 shutil.rmtree(item_path, onexc=_remove_readonly)
             else:
                 try:
-                    os.remove(item_path)
+                    item_path.unlink()
                 except PermissionError:
-                    os.chmod(item_path, 0o700)
-                    os.remove(item_path)
+                    item_path.chmod(0o700)
+                    item_path.unlink()
 
         clone_result = _call_with_retries(
             "Cloning from github",
-            lambda: Repo.clone_from(repo_url, self.save_path, progress=CloneProgress()),
+            lambda: Repo.clone_from(repo_url, str(self.save_path), progress=CloneProgress()),
             retry_delay_seconds=30,
             max_retries=3,
         )
@@ -194,24 +194,25 @@ class NewsDownloader(BaseNewsDownloader):
 
     def parse_repository(self) -> None:
         metadata = {}
-        source_datasets_dir = os.path.join(self.save_path, "News_Datasets")
+        source_datasets_dir = self.save_path / "News_Datasets"
         allowed_topics = self.download_config
 
         iter_files = [
-            f
-            for f in os.listdir(source_datasets_dir)
-            if f.split("_")[0] in allowed_topics
+            entry
+            for entry in source_datasets_dir.iterdir()
+            if entry.name.split("_")[0] in allowed_topics
         ]
-        for filename in tqdm(
+        for archive_path in tqdm(
             iter_files,
             desc="Unzipping files",
             dynamic_ncols=True,
             file=sys.stdout,
         ):
-            if not filename.endswith(".zip"):
+            filename = archive_path.name
+            if archive_path.suffix != ".zip":
                 continue
 
-            base_name = filename[:-4]
+            base_name = archive_path.stem
             parts = base_name.rsplit("_", 2)
             if len(parts) != 3:
                 logger.warning(
@@ -226,8 +227,8 @@ class NewsDownloader(BaseNewsDownloader):
                     datetime.strptime(date_str, "%Y%m%d%H%M%S").date().isoformat()
                 )
 
-                zip_path = os.path.join(source_datasets_dir, filename)
-                extract_dir = os.path.join(self.save_path, base_name)
+                zip_path = archive_path
+                extract_dir = self.save_path / base_name
 
                 collection_name = (
                     f"{topic_normalized}_{sentiment}".replace(" ", "_")
@@ -235,38 +236,27 @@ class NewsDownloader(BaseNewsDownloader):
                     .lower()
                 )
 
-                os.makedirs(extract_dir, exist_ok=True)
+                extract_dir.mkdir(parents=True, exist_ok=True)
 
                 with ZipFile(zip_path, "r") as zip_ref:
                     zip_ref.extractall(extract_dir)
 
-                nested_extract_dir = os.path.join(extract_dir, base_name)
-                if os.path.isdir(nested_extract_dir):
-                    for nested_item in os.listdir(nested_extract_dir):
+                nested_extract_dir = extract_dir / base_name
+                if nested_extract_dir.is_dir():
+                    for nested_item in nested_extract_dir.iterdir():
                         shutil.move(
-                            os.path.join(nested_extract_dir, nested_item),
-                            os.path.join(extract_dir, nested_item),
+                            str(nested_item),
+                            str(extract_dir / nested_item.name),
                         )
                     shutil.rmtree(nested_extract_dir, onexc=_remove_readonly)
 
-                article_file_paths = []
-                for root_dir, _, files in os.walk(extract_dir):
-                    for article_filename in files:
-                        if article_filename.endswith(".json"):
-                            article_file_paths.append(
-                                os.path.abspath(
-                                    os.path.join(root_dir, article_filename)
-                                )
-                            )
-
-                article_file_paths.sort()
+                article_file_paths = sorted(extract_dir.rglob("*.json"))
 
                 for article_file_path in article_file_paths:
                     try:
-                        with open(
-                            article_file_path, "r", encoding="utf-8"
-                        ) as article_file:
-                            article_payload = json.load(article_file)
+                        article_payload = json.loads(
+                            article_file_path.read_text(encoding="utf-8")
+                        )
                     except (OSError, json.JSONDecodeError) as exc:
                         logger.warning(
                             f"Skipping invalid article file: {article_file_path}",
@@ -285,7 +275,7 @@ class NewsDownloader(BaseNewsDownloader):
                             "Skipping article with unsupported language metadata",
                             extra={
                                 "operation": "Parsing article JSON",
-                                "article_file_path": article_file_path,
+                                "article_file_path": str(article_file_path),
                                 "language": article_payload.get("language"),
                             },
                         )
@@ -296,9 +286,9 @@ class NewsDownloader(BaseNewsDownloader):
                             "topic": topic,
                             "sentiment": sentiment,
                             "date": parsed_date,
-                            "archive_file": os.path.abspath(zip_path),
-                            "extracted_dir": os.path.abspath(extract_dir),
-                            "article_file_path": os.path.abspath(article_file_path),
+                            "archive_file": str(zip_path.resolve()),
+                            "extracted_dir": str(extract_dir.resolve()),
+                            "article_file_path": str(article_file_path.resolve()),
                             "archive_name": base_name,
                             "article": article_payload,
                         }
@@ -309,25 +299,23 @@ class NewsDownloader(BaseNewsDownloader):
 
     def clean_repository(self) -> None:
         preserved_dirs = {
-            os.path.abspath(metadata_entry["extracted_dir"])
+            str(Path(metadata_entry["extracted_dir"]).resolve())
             for metadata_entries in self.parsed_metadata.values()
             for metadata_entry in metadata_entries
         }
 
-        for item in os.listdir(self.save_path):
-            item_path = os.path.join(self.save_path, item)
-            item_abs_path = os.path.abspath(item_path)
-            if item_abs_path in preserved_dirs:
+        for item_path in self.save_path.iterdir():
+            if str(item_path.resolve()) in preserved_dirs:
                 continue
 
-            if os.path.isdir(item_path):
+            if item_path.is_dir():
                 shutil.rmtree(item_path, onexc=_remove_readonly)
             else:
                 try:
-                    os.remove(item_path)
+                    item_path.unlink()
                 except PermissionError:
-                    os.chmod(item_path, 0o700)
-                    os.remove(item_path)
+                    item_path.chmod(0o700)
+                    item_path.unlink()
 
     def get_embeddings(self, texts: list[str]) -> list[list[float]]:
         try:

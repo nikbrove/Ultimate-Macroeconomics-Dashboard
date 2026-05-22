@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import logging
+from pathlib import Path
 from typing import Any, Dict, List
 
 import httpx
@@ -21,8 +22,8 @@ MAX_SQL_ROWS = 500
 
 def configure_runtime(
     *,
-    database_schema_path: str,
-    news_topics_path: str,
+    database_schema_path: Path,
+    news_topics_path: Path,
     qdrant_url: str,
     qdrant_api_key: str,
     postgres_database_uri: str,
@@ -41,11 +42,12 @@ def configure_runtime(
     _runtime["openai_base_url"] = openai_base_url
     _runtime["openai_embedding_model"] = openai_embedding_model
 
-    with open(database_schema_path) as fh:
-        _runtime["database_schema"] = yaml.safe_load(fh)
-
-    with open(news_topics_path) as fh:
-        _runtime["news_topics"] = json.load(fh)
+    _runtime["database_schema"] = yaml.safe_load(
+        Path(database_schema_path).read_text(encoding="utf-8")
+    )
+    _runtime["news_topics"] = json.loads(
+        Path(news_topics_path).read_text(encoding="utf-8")
+    )
 
     _runtime["_engine"] = None
     _runtime["_qdrant_client"] = None

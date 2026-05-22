@@ -1,19 +1,20 @@
 import logging
 import os
-import yaml
+from pathlib import Path
+from typing import Iterable
+
 import connectorx as cx
 import polars as pl
 import streamlit as st
-from typing import Iterable
+import yaml
 
 from dotenv import load_dotenv
 from core.app_logging import log_sql_query
 
-CONFIG_PATH = "config.yaml"
-ENV_FILE_PATH = ".env"
+CONFIG_PATH = Path("config.yaml")
+ENV_FILE_PATH = Path(".env")
 
-with open(CONFIG_PATH) as f:
-    CONFIG = yaml.safe_load(f)
+CONFIG = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
 load_dotenv(ENV_FILE_PATH)
 
 _PG = CONFIG.get("postgres", {})

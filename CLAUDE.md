@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Running the stack
 
-There is no host-side build system, no test suite, and no linter. Everything runs inside containers via Docker Compose; each service has its own `requirements.txt` installed into its image. Local Python is not used.
+There is no test suite or linter. Everything runs inside containers via Docker Compose. Every service is Python 3.12 and uses [uv](https://docs.astral.sh/uv/) for dependency management — each service has its own `pyproject.toml` + `uv.lock`, and the Dockerfile runs `uv sync --frozen` into `/opt/venv`.
 
 ```bash
 # Full stack (build + run, foreground)
@@ -23,14 +23,19 @@ docker compose logs -f app
 docker compose logs -f agent
 ```
 
+For local iteration without rebuilding the image, work in any service directory:
+
+```bash
+cd app           # or agent, forecaster, etc.
+uv sync          # creates .venv from pyproject.toml + uv.lock
+uv run python -m streamlit run app.py   # or uvicorn main:app for FastAPI services
+uv add <package>      # add a dependency (updates pyproject.toml + uv.lock)
+uv lock --upgrade     # refresh the lockfile
+```
+
 First boot requires `_container_data/.env` (copy from `_container_data/.env.example`) and a populated LLM section in `_container_data/config.yaml`. The `db_init` container runs once to provision Postgres roles; `downloader_general` then runs once (~1–2h) to ingest World Bank + Yahoo Finance + Webz.io news. The dashboard is at `http://localhost:8501`.
 
 If the host has no NVIDIA GPU, remove the `deploy:` block from the `forecaster` service in `docker-compose.yaml` (the `chronos` model will be skipped; `pmdarima` and `prophet` still work).
-
-## Branches
-
-- `main` — local-dev topology. Every backend service publishes its port on the host. The operator's `.env` holds the LLM key.
-- `hosting` — production topology. Only `nginx` (port 80) is exposed; backend services live on an internal Docker network; the LLM key is collected per-session from the end user and lives in `st.session_state` for that tab. Embedding/RAG keys stay server-side. Don't merge hosting-only infrastructure (nginx config, internal networks, session-key plumbing) into `main`.
 
 ## Architecture
 

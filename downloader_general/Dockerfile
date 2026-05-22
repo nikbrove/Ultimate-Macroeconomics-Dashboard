@@ -2,10 +2,14 @@ FROM python:3.12-slim AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PATH="/opt/venv/bin:${PATH}"
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_PROJECT_ENVIRONMENT=/opt/venv \
+    PATH=/opt/venv/bin:$PATH
 
 WORKDIR /app
+
+COPY --from=ghcr.io/astral-sh/uv:0.11 /uv /uvx /usr/local/bin/
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -14,12 +18,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-RUN python -m venv /opt/venv
+COPY pyproject.toml uv.lock ./
 
-COPY requirements.txt ./requirements.txt
-
-RUN pip install --upgrade pip setuptools wheel \
-    && pip install -r requirements.txt 
+RUN uv sync --frozen --no-install-project --no-dev
 
 
 
@@ -27,7 +28,7 @@ FROM python:3.12-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PATH="/opt/venv/bin:${PATH}"
+    PATH=/opt/venv/bin:$PATH
 
 WORKDIR /app
 

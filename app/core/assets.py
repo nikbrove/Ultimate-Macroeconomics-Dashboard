@@ -1,18 +1,17 @@
-import os
 import json
 from functools import lru_cache
+from pathlib import Path
 from string import Template
 from typing import Any
 
 
-_ASSETS_DIR = "assets"
-_PLOT_MARKUP_TEMPLATES_PATH = os.path.join(_ASSETS_DIR, "plot_markup_templates.json")
+_ASSETS_DIR = Path("assets")
+_PLOT_MARKUP_TEMPLATES_PATH = _ASSETS_DIR / "plot_markup_templates.json"
 
 
 @lru_cache(maxsize=1)
 def _load_plot_markup_templates() -> dict[str, str]:
-    with open(_PLOT_MARKUP_TEMPLATES_PATH, "r", encoding="utf-8") as file:
-        payload = json.load(file)
+    payload = json.loads(_PLOT_MARKUP_TEMPLATES_PATH.read_text(encoding="utf-8"))
     return {
         str(key): str(value)
         for key, value in payload.items()

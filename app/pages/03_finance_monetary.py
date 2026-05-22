@@ -5,7 +5,7 @@ import streamlit as st
 
 from core.page_helpers import fetch_indicator_slice
 from core.plotting import apply_plotly_theme
-from core.theming import get_color, get_colorway
+from core.theming import get_color, get_colorway, get_diverging_colorscale
 from core.postgres_client import (
     get_world_bank_country_mapping,
 )
@@ -245,7 +245,7 @@ def _render_inflation_heatmap_deep_dive() -> None:
             y=y_labels,
             zmin=-INFLATION_CLIP,
             zmax=INFLATION_CLIP,
-            colorscale="RdBu_r",
+            colorscale=get_diverging_colorscale(reverse=True),
             colorbar={"title": "CPI %"},
             hovertemplate="%{y}<br>%{x}: %{z:.2f}%<extra></extra>",
         )
