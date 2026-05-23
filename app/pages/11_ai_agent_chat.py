@@ -1,15 +1,24 @@
+"""AI Analyst chat page — streams responses from the LangGraph agent.
+
+Streamlit re-renders this script on every interaction, so chat state
+lives in ``st.session_state[CHAT_STATE_KEY]``. The page wraps the SSE
+stream from :func:`core.api_client.agent_chat_stream` and pretty-prints
+each event kind (``step`` / ``token`` / ``final`` / ``error``), then
+renders any returned artifacts (plot JSON, tabular data) inline.
+"""
+
 import hashlib
 import re
 
-import polars as pl
 import plotly.io as pio
+import polars as pl
 import streamlit as st
 
-from core.app_logging import log_page_render
 from core.api_client import agent_chat_stream
+from core.app_logging import log_page_render
 from core.plotting import apply_plotly_theme
 from core.token_usage import record_usage
-
+from core.token_usage_store import record_persistent
 
 CHAT_STATE_KEY = "agent_chat_messages"
 TABLE_PREVIEW_LIMIT = 100
@@ -43,11 +52,13 @@ def _normalize_math_delimiters(text: str) -> str:
 
 
 def _ensure_chat_state() -> None:
+    """Create the empty chat history list on first render."""
     if CHAT_STATE_KEY not in st.session_state:
         st.session_state[CHAT_STATE_KEY] = []
 
 
 def _as_artifacts(value: object) -> dict:
+    """Coerce an unknown value to ``dict``; return ``{}`` when not a dict."""
     return value if isinstance(value, dict) else {}
 
 
@@ -93,6 +104,7 @@ def _build_data_table_view(artifacts: dict) -> dict | None:
 
 
 def _render_data_expander(artifacts: dict, message_key: str) -> None:
+    """Render the "Show data table" expander under an assistant message."""
     view = _build_data_table_view(artifacts)
     if view is None:
         return
@@ -133,6 +145,7 @@ def _render_data_expander(artifacts: dict, message_key: str) -> None:
 
 
 def _render_plot_artifact(plot_artifact: object, message_key: str) -> None:
+    """Render a Plotly figure JSON artifact produced by the plotly_agent worker."""
     if not isinstance(plot_artifact, dict):
         return
 
@@ -155,6 +168,7 @@ def _render_plot_artifact(plot_artifact: object, message_key: str) -> None:
 
 
 def _render_execution_log(steps: list[str], placeholder, finished: bool) -> None:
+    """Render the worker-step breadcrumb (e.g. ``router → sql_agent → chat_agent``)."""
     if not steps:
         placeholder.empty()
         return
@@ -164,20 +178,20 @@ def _render_execution_log(steps: list[str], placeholder, finished: bool) -> None
 
 
 def _render_assistant_artifacts(artifacts: dict, message_key: str) -> None:
+    """Render the plot + data-table block emitted by the agent's ``final`` event."""
     _render_plot_artifact(artifacts.get("latest_plotly"), message_key=message_key)
     _render_data_expander(artifacts, message_key=message_key)
 
 
 def _render_messages() -> None:
+    """Replay the chat history from ``st.session_state`` on every rerun."""
     for index, message in enumerate(st.session_state[CHAT_STATE_KEY]):
         role = message.get("role", "assistant")
         content = str(message.get("content", ""))
         with st.chat_message(role):
             steps = message.get("steps") if role == "assistant" else None
             if steps:
-                arrow_chain = " → ".join(
-                    STEP_DISPLAY_NAMES.get(s, s) for s in steps
-                )
+                arrow_chain = " → ".join(STEP_DISPLAY_NAMES.get(s, s) for s in steps)
                 st.markdown(f"`{arrow_chain}`")
             if role == "assistant":
                 st.markdown(_normalize_math_delimiters(content))
@@ -192,6 +206,7 @@ def _render_messages() -> None:
 
 
 def _trim_history_for_api() -> list[dict[str, str]]:
+    """Return the last 24 chat turns reduced to ``{"role", "content"}`` dicts."""
     raw_messages = st.session_state[CHAT_STATE_KEY]
     history: list[dict[str, str]] = []
     for message in raw_messages[-24:]:
@@ -212,6 +227,13 @@ def _dedupe_step(steps: list[str], node: str) -> None:
 
 
 def _handle_chat() -> None:
+    """Read one user prompt, stream the agent response, append to history.
+
+    Handles the SSE event types (``step`` / ``token`` / ``final`` /
+    ``error``), persists token usage to both the in-session aggregator
+    and the Postgres table, and renders any artifacts emitted in the
+    ``final`` event.
+    """
     prompt = st.chat_input("Ask the AI analyst...")
     if not prompt:
         return
@@ -252,11 +274,11 @@ def _handle_chat() -> None:
                             _normalize_math_delimiters("".join(answer_buffer))
                         )
                 elif event_type == "final":
-                    final_answer = str(event.get("answer", "")) or "".join(
-                        answer_buffer
-                    )
+                    final_answer = str(event.get("answer", "")) or "".join(answer_buffer)
                     artifacts = _as_artifacts(event.get("artifacts"))
-                    record_usage(event.get("usage"))
+                    usage_payload = event.get("usage")
+                    record_usage(usage_payload)
+                    record_persistent("chat", usage_payload)
                     break
                 elif event_type == "error":
                     error_text = str(event.get("answer", "Agent error."))
@@ -295,6 +317,7 @@ def _handle_chat() -> None:
 
 
 def render_page() -> None:
+    """Page entry-point: title, prior messages, then the chat input handler."""
     log_page_render("AI Analyst")
     st.title("AI Analyst")
     st.caption("Chat interface backed by the agent server in task-mode by default.")

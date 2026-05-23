@@ -7,6 +7,7 @@ plotly_agent, ...) plus the final synthesis stream. The aggregate is returned
 in the `final` event of the SSE stream so the dashboard can display per-session
 totals.
 """
+
 from __future__ import annotations
 
 from typing import Any

@@ -5,17 +5,18 @@ event of `/chat/stream` (and inline in `/plots/interpret` responses). The app
 accumulates these into `st.session_state` under a single key, broken down by
 model. Counts are in-memory only and disappear when the session ends.
 """
+
 from __future__ import annotations
 
 from typing import Any
 
 import streamlit as st
 
-
 SESSION_STATE_KEY = "token_usage_by_model"
 
 
 def _bucket() -> dict[str, dict[str, int]]:
+    """Return (creating on demand) the ``model -> counts`` dict in session state."""
     bucket = st.session_state.get(SESSION_STATE_KEY)
     if not isinstance(bucket, dict):
         bucket = {}
@@ -45,10 +46,12 @@ def record_usage(usage: dict[str, Any] | None) -> None:
 
 
 def get_session_token_usage() -> dict[str, dict[str, int]]:
+    """Return a copy of the per-model token-usage map for this session."""
     return dict(_bucket())
 
 
 def total_session_tokens() -> dict[str, int]:
+    """Return the prompt / completion / total token sums across every model used this session."""
     totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     for entry in _bucket().values():
         totals["prompt_tokens"] += int(entry.get("prompt_tokens", 0))
@@ -58,4 +61,5 @@ def total_session_tokens() -> dict[str, int]:
 
 
 def reset_session_token_usage() -> None:
+    """Clear the per-session counters (used by the "Reset token counter" button)."""
     st.session_state[SESSION_STATE_KEY] = {}

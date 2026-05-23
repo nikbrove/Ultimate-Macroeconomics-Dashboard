@@ -1,16 +1,21 @@
-import plotly.express as px
+"""Demography page — population, growth, labour force, age structure.
+
+Adds two custom blocks around the standard cards: a population-bubble
+explorer (size = population, hover = growth / labour force) and an
+age-structure pyramid showing 0–14 / 15–64 / 65+ shares over time.
+"""
+
 import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
 
 from core.page_helpers import fetch_indicator_slice
 from core.plotting import apply_plotly_theme
-from core.theming import get_color, get_colorway
 from core.postgres_client import (
     get_world_bank_country_mapping,
 )
-from pages.page_utils import render_page_from_config
-
+from core.theming import get_color, get_colorway
+from pages.page_utils import get_shared_selected_countries, render_page_from_config
 
 PAGE_TITLE = "Demography"
 AGE_0_14_INDICATOR_ID = "SP.POP.0014.TO.ZS"
@@ -26,6 +31,7 @@ FEMALE_POPULATION_INDICATOR_ID = "SP.POP.TOTL.FE.IN"
 
 
 def _render_demography_bubble() -> None:
+    """Render the population × growth bubble explorer at the top of the page."""
     st.subheader("Population Bubble Explorer")
     st.caption(
         "Bubble size reflects total population. Hover includes population growth, "
@@ -54,25 +60,19 @@ def _render_demography_bubble() -> None:
     )
 
     joined_df = (
-        total_population_df.join(
-            population_growth_df, on=["year", "economy"], how="inner"
-        )
+        total_population_df.join(population_growth_df, on=["year", "economy"], how="inner")
         .join(labor_force_df, on=["year", "economy"], how="inner")
         .join(male_population_df, on=["year", "economy"], how="inner")
         .join(female_population_df, on=["year", "economy"], how="inner")
     )
 
     if joined_df.is_empty():
-        st.info(
-            "Demography bubble chart is unavailable because source data is incomplete."
-        )
+        st.info("Demography bubble chart is unavailable because source data is incomplete.")
         st.divider()
         return
 
     country_map = get_world_bank_country_mapping()
-    if not country_map.is_empty() and {"id", "value"}.issubset(
-        set(country_map.columns)
-    ):
+    if not country_map.is_empty() and {"id", "value"}.issubset(set(country_map.columns)):
         country_map = country_map.select(
             [
                 pl.col("id").cast(pl.Utf8).str.to_uppercase().alias("economy"),
@@ -85,9 +85,7 @@ def _render_demography_bubble() -> None:
         pl.coalesce([pl.col("country_name"), pl.col("economy")]).alias("country_name")
     )
 
-    year_options = (
-        joined_df.select("year").unique().sort("year").get_column("year").to_list()
-    )
+    year_options = joined_df.select("year").unique().sort("year").get_column("year").to_list()
     if not year_options:
         st.info("Demography bubble chart is unavailable because years are missing.")
         st.divider()
@@ -109,37 +107,54 @@ def _render_demography_bubble() -> None:
         return
 
     plot_df = year_df.to_pandas()
-    fig = px.scatter(
-        plot_df,
-        x="population_growth",
-        y="labor_force",
-        size="total_population",
-        color="country_name",
-        hover_name="country_name",
-        hover_data={
-            "economy": True,
-            "population_growth": ":.2f",
-            "labor_force": ":,.0f",
-            "male_population": ":,.0f",
-            "female_population": ":,.0f",
-            "total_population": ":,.0f",
-        },
-        labels={
-            "population_growth": "Population growth (% annual)",
-            "labor_force": "Labor force (people)",
-            "total_population": "Total population",
-            "country_name": "Country",
-        },
-        size_max=55,
+    pop_max = float(plot_df["total_population"].max() or 1.0)
+    sizeref = 2.0 * pop_max / (55.0 * 55.0)
+    palette = get_colorway()
+
+    fig = go.Figure()
+    for index, country_name in enumerate(plot_df["country_name"].tolist()):
+        row = plot_df.iloc[index]
+        fig.add_trace(
+            go.Scatter(
+                x=[row["population_growth"]],
+                y=[row["labor_force"]],
+                mode="markers",
+                name=str(country_name),
+                marker={
+                    "size": [float(row["total_population"])],
+                    "sizemode": "area",
+                    "sizeref": sizeref,
+                    "sizemin": 4,
+                    "color": palette[index % len(palette)] if palette else None,
+                    "opacity": 0.78,
+                    "line": {"width": 0.5},
+                },
+                text=[country_name],
+                customdata=[
+                    [
+                        row["economy"],
+                        row["male_population"],
+                        row["female_population"],
+                        row["total_population"],
+                    ]
+                ],
+                hovertemplate=(
+                    "<b>%{text}</b> (%{customdata[0]})<br>"
+                    "Population growth: %{x:.2f}%<br>"
+                    "Labor force: %{y:,.0f}<br>"
+                    "Male population: %{customdata[1]:,.0f}<br>"
+                    "Female population: %{customdata[2]:,.0f}<br>"
+                    "Total population: %{customdata[3]:,.0f}<extra></extra>"
+                ),
+            )
+        )
+
+    fig.update_layout(
         title=f"Population Growth vs Labor Force ({selected_year})",
+        xaxis_title="Population growth (% annual)",
+        yaxis_title="Labor force (people)",
+        showlegend=False,
     )
-    fig.update_traces(
-        marker={
-            "opacity": 0.78,
-            "line": {"width": 0.5},
-        }
-    )
-    fig.update_layout(showlegend=False)
     fig.update_yaxes(tickformat=",.2s")
     fig = apply_plotly_theme(fig)
 
@@ -148,6 +163,7 @@ def _render_demography_bubble() -> None:
 
 
 def _render_age_structure_deep_dive() -> None:
+    """Render the age-structure (0-14 / 15-64 / 65+) block at the bottom of the page."""
     st.divider()
     st.subheader("Age Structure (ternary plot)")
     st.caption(
@@ -164,9 +180,7 @@ def _render_age_structure_deep_dive() -> None:
         st.info("Age structure ternary is unavailable - source data missing.")
         return
 
-    joined = young.join(working, on=["year", "economy"]).join(
-        elderly, on=["year", "economy"]
-    )
+    joined = young.join(working, on=["year", "economy"]).join(elderly, on=["year", "economy"])
     if joined.is_empty():
         st.info("No overlapping age-structure observations.")
         return
@@ -189,7 +203,7 @@ def _render_age_structure_deep_dive() -> None:
 
     selected_iso_codes = {
         str(c).strip().upper()
-        for c in st.session_state.get(f"{PAGE_TITLE}_countries", [])
+        for c in get_shared_selected_countries()
         if str(c).strip()
     }
     snapshot = snapshot.with_columns(
@@ -201,27 +215,38 @@ def _render_age_structure_deep_dive() -> None:
 
     plot_df = snapshot.to_pandas()
 
-    fig = px.scatter_ternary(
-        plot_df,
-        a="young",
-        b="working",
-        c="elderly",
-        color="group",
-        category_orders={"group": ["Other", "Selected"]},
-        color_discrete_map={
-            "Other": get_color("reference_line"),
-            "Selected": get_colorway()[0],
-        },
-        hover_name="country_name",
-        hover_data={
-            "economy": True,
-            "young": ":.1f",
-            "working": ":.1f",
-            "elderly": ":.1f",
-            "group": False,
-        },
-        title=f"Age structure ({latest_year})",
-    )
+    fig = go.Figure()
+    group_colors = {
+        "Other": get_color("reference_line"),
+        "Selected": get_colorway()[0],
+    }
+    for group_name in ("Other", "Selected"):
+        group_rows = plot_df[plot_df["group"] == group_name]
+        if group_rows.empty:
+            continue
+        fig.add_trace(
+            go.Scatterternary(
+                a=group_rows["young"],
+                b=group_rows["working"],
+                c=group_rows["elderly"],
+                mode="markers",
+                name=group_name,
+                marker={
+                    "color": group_colors[group_name],
+                    "size": 9,
+                    "opacity": 0.78,
+                    "line": {"width": 0.5},
+                },
+                text=group_rows["country_name"],
+                customdata=group_rows[["economy"]].to_numpy(),
+                hovertemplate=(
+                    "<b>%{text}</b> (%{customdata[0]})<br>"
+                    "Young: %{a:.1f}%<br>"
+                    "Working: %{b:.1f}%<br>"
+                    "Elderly: %{c:.1f}%<extra></extra>"
+                ),
+            )
+        )
 
     selected_df = plot_df[plot_df["group"] == "Selected"]
     if not selected_df.empty:
@@ -238,16 +263,13 @@ def _render_age_structure_deep_dive() -> None:
             )
         )
 
-    fig.update_traces(
-        selector={"mode": "markers"},
-        marker={"size": 9, "opacity": 0.78, "line": {"width": 0.5}},
-    )
     fig.update_layout(
+        title=f"Age structure ({latest_year})",
         ternary={
             "aaxis": {"title": "Young 0-14 (%)"},
             "baxis": {"title": "Working 15-64 (%)"},
             "caxis": {"title": "Elderly 65+ (%)"},
-        }
+        },
     )
     fig = apply_plotly_theme(fig)
 

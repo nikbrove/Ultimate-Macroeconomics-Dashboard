@@ -1,5 +1,5 @@
 {
-    "gdp_snapshot_card": "<div style='min-height:${min_height}px;display:flex;flex-direction:column;justify-content:center;text-align:center;'><div style='font-size:0.95rem;font-weight:600;color:#334155;'>${title}</div><div style='margin-top:0.55rem;font-size:2rem;font-weight:700;color:${trend_color};line-height:1.15;'>${formatted_value}</div><div style='margin-top:0.5rem;font-size:1rem;font-weight:600;color:${trend_color};'>${delta_text}</div></div>",
+    "gdp_snapshot_card": "<div style='min-height:${min_height}px;display:flex;flex-direction:column;justify-content:center;text-align:center;'><div style='font-size:0.95rem;font-weight:600;color:${card_title_color};'>${title}</div><div style='margin-top:0.55rem;font-size:2rem;font-weight:700;color:${trend_color};line-height:1.15;'>${formatted_value}</div><div style='margin-top:0.5rem;font-size:1rem;font-weight:600;color:${trend_color};'>${delta_text}</div></div>",
     "gdp_share_pie_hovertemplate": "%{label}<br>GDP: $%{value:,.0f}<br>Share: %{percent}<extra></extra>",
     "line_plot_ci_suffix": "<br>CI Lower: %{customdata[0]}<br>CI Upper: %{customdata[1]}",
     "line_plot_group_hovertemplate": "$series_label: %{fullData.name}<br>$value_label: %{y}$ci_suffix<extra></extra>",

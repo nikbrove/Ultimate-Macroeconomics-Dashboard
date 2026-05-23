@@ -37,7 +37,6 @@ dependencies = [
     "python-dotenv==1.2.1",
     "pytz==2026.1.post1",
     "referencing==0.37.0",
-    "requests==2.32.5",
     "qdrant-client==1.17.0",
     "pyyaml==6.0.3",
     "rpds-py==0.30.0",
@@ -61,3 +60,54 @@ build-backend = "hatchling.build"
 
 [tool.uv]
 package = false
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.14",
+    "ty>=0.0.39",
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra --strict-markers --cov --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["main.py"]
+branch = true
+omit = ["tests/*", "**/__init__.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.ty.environment]
+python-version = "3.12"
+
+[tool.ty.rules]
+unresolved-import = "ignore"
+no-matching-overload = "ignore"
+unknown-argument = "ignore"
+unresolved-attribute = "warn"
+invalid-argument-type = "warn"
+invalid-assignment = "warn"

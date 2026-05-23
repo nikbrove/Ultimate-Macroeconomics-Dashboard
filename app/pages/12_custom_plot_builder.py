@@ -1,9 +1,16 @@
+"""Custom plot constructor — pick any indicator from the config and render it as a ``GraphBox``.
+
+Two cascading selectboxes (category → indicator) drive a single
+:class:`core.plotting.GraphBox` so the user can explore any WB indicator
+without leaving a dedicated page. Selection is persisted across reruns
+via the page's session-state slot.
+"""
+
 import streamlit as st
 
 from core.app_logging import log_page_render
 from core.plotting import GraphBox
 from pages.page_utils import load_dashboard_config, render_country_selector
-
 
 log_page_render("Custom Plot Constructor")
 st.title("Custom Plot Constructor")
@@ -32,6 +39,7 @@ indicator_indices = list(range(len(available_items)))
 
 
 def _format_indicator(index: int) -> str:
+    """Pretty-print the selectbox label as ``"Name (ID)"`` (or whatever's available)."""
     item = available_items[index]
     item_id = str(item.get("id", "")).strip()
     item_name = str(item.get("name", "")).strip()

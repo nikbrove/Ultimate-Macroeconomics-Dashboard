@@ -1,13 +1,30 @@
-import sys
-import logging
-from urllib.parse import urlparse
+"""Centralised logger and structured log helpers for the dashboard.
 
+A single ``ultimate_macroeconomics_dashboard`` logger is configured on first
+use with both a file handler (``_container_data/app.log``) and stdout. Pages
+and helpers should use the ``log_*`` functions below instead of ad-hoc
+``logger.info`` calls so query / HTTP / page-render events stay greppable.
+"""
+
+import logging
+import sys
+from urllib.parse import urlparse
 
 LOGGER_NAME = "ultimate_macroeconomics_dashboard"
 DEFAULT_LOG_FILE_NAME = "app.log"
 
 
 def _normalize_text(value: object, limit: int = 240) -> str:
+    """Collapse whitespace and truncate ``value`` to at most ``limit`` chars.
+
+    Args:
+        value: Anything stringifiable.
+        limit: Maximum output length; an ellipsis replaces the last 3 chars
+            when truncation occurs.
+
+    Returns:
+        A single-line, length-bounded representation suitable for log output.
+    """
     text = " ".join(str(value or "").split())
     if len(text) <= limit:
         return text
@@ -15,6 +32,7 @@ def _normalize_text(value: object, limit: int = 240) -> str:
 
 
 def get_app_logger() -> logging.Logger:
+    """Return the singleton application logger, configuring it on first call."""
     logger = logging.getLogger(LOGGER_NAME)
     if getattr(logger, "_ultimate_logger_configured", False):
         return logger
@@ -37,10 +55,12 @@ def get_app_logger() -> logging.Logger:
 
 
 def log_page_render(page_name: str) -> None:
+    """Record a page navigation event for analytics / debugging."""
     get_app_logger().info("page_render page=%s", _normalize_text(page_name, limit=120))
 
 
 def log_sql_query(query: str, target: str = "postgres_db") -> None:
+    """Record a SQL query being sent to ``target`` (typically ``postgres_db``)."""
     get_app_logger().info(
         "sql_query target=%s query=%s",
         _normalize_text(target, limit=120),
@@ -54,6 +74,14 @@ def log_http_request(
     method: str,
     summary: str | None = None,
 ) -> None:
+    """Record an outbound HTTP request to a backend service.
+
+    Args:
+        base_url: Full base URL of the target service; the host part is logged.
+        endpoint: Path portion (``/predict`` etc.).
+        method: HTTP verb (case-insensitive — normalised to upper).
+        summary: Optional one-line summary of relevant params.
+    """
     parsed = urlparse(str(base_url or "").strip())
     target = parsed.netloc or parsed.path or "unknown"
 
@@ -72,6 +100,7 @@ def log_vector_query(
     summary: str | None = None,
     target: str = "vector_db",
 ) -> None:
+    """Record a Qdrant operation against ``collection_name`` on ``target``."""
     get_app_logger().info(
         "vector_query target=%s operation=%s collection=%s summary=%s",
         _normalize_text(target, limit=120),

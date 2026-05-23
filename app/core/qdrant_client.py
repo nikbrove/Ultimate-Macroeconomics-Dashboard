@@ -1,7 +1,15 @@
+"""Read-side Qdrant helpers used by the news / RAG pages.
+
+A module-level :class:`QdrantClient` is built from ``config.yaml`` + ``.env``;
+every function accepts an optional override for testability. All operations
+swallow failures and degrade to empty results — the news page renders an
+informative empty state instead of crashing when Qdrant is down.
+"""
+
 import logging
 import os
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional
 
 import yaml
 from dotenv import load_dotenv
@@ -36,6 +44,14 @@ _DEFAULT_CLIENT = QdrantClient(
 
 
 def is_qdrant_available(client: Optional[QdrantClient] = None) -> bool:
+    """Return ``True`` iff ``client.get_collections()`` succeeds.
+
+    Args:
+        client: Optional override (default: module-level client).
+
+    Returns:
+        ``True`` on success, ``False`` otherwise.
+    """
     client = client or _DEFAULT_CLIENT
     log_vector_query(operation="health_check")
     try:
@@ -47,6 +63,14 @@ def is_qdrant_available(client: Optional[QdrantClient] = None) -> bool:
 
 
 def list_collections(client: Optional[QdrantClient] = None) -> List[str]:
+    """Return the names of every collection visible to the client.
+
+    Args:
+        client: Optional override (default: module-level client).
+
+    Returns:
+        List of collection names; empty list when the API call fails.
+    """
     client = client or _DEFAULT_CLIENT
     log_vector_query(operation="list_collections")
     try:
@@ -62,6 +86,16 @@ def scroll_collection(
     client: Optional[QdrantClient] = None,
     page_limit: int = 256,
 ) -> List[models.Record]:
+    """Page through every point in a collection and return them in one list.
+
+    Args:
+        collection_name: Target Qdrant collection.
+        client: Optional override (default: module-level client).
+        page_limit: Number of records fetched per scroll page.
+
+    Returns:
+        List of payload-carrying records (vectors stripped); empty on error.
+    """
     client = client or _DEFAULT_CLIENT
     log_vector_query(
         operation="scroll_collection",
@@ -89,9 +123,7 @@ def scroll_collection(
 
         return all_records
     except Exception as exc:
-        logger.warning(
-            "Qdrant scroll_collection failed for '%s': %s", collection_name, exc
-        )
+        logger.warning("Qdrant scroll_collection failed for '%s': %s", collection_name, exc)
         return []
 
 
@@ -101,6 +133,18 @@ def get_point(
     client: Optional[QdrantClient] = None,
     with_vector: bool = False,
 ) -> Optional[models.Record]:
+    """Retrieve a single point from a collection.
+
+    Args:
+        collection_name: Target Qdrant collection.
+        point_id: Identifier of the point to fetch.
+        client: Optional override (default: module-level client).
+        with_vector: When ``True`` the embedding is returned alongside the payload.
+
+    Returns:
+        The matching record, or ``None`` when no point with the given id exists
+        (or the request fails).
+    """
     client = client or _DEFAULT_CLIENT
     log_vector_query(
         operation="get_point",
@@ -136,6 +180,27 @@ def find_nearest_embeddings(
     return_payload_fields: Optional[List[str]] = None,
     exclude_point_id: str | None = None,
 ) -> List[models.ScoredPoint]:
+    """Run a nearest-neighbour search over a Qdrant collection.
+
+    Prefers ``client.query_points`` when available (newer API) and falls back
+    to ``client.search`` otherwise.
+
+    Args:
+        collection_name: Target Qdrant collection.
+        query_vector: Query embedding.
+        client: Optional override (default: module-level client).
+        limit: Maximum number of hits to return.
+        exact_match_filter: Optional ``payload_key -> value`` map applied as
+            an AND of ``MatchValue`` conditions.
+        return_payload_fields: When supplied, only those payload fields are
+            returned (the rest are dropped server-side).
+        exclude_point_id: Optional id to filter out of the result set
+            (useful for "related items, excluding the current one").
+
+    Returns:
+        Up to ``limit`` scored points sorted by descending similarity;
+        empty list on error.
+    """
     client = client or _DEFAULT_CLIENT
     log_vector_query(
         operation="find_nearest_embeddings",

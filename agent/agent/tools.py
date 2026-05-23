@@ -1,7 +1,17 @@
+"""Tool implementations invoked by the LangGraph workers.
+
+Each LangGraph worker in :mod:`agent.graph` calls one or more of the
+async helpers in this module: SQL execution, Qdrant news search, sandbox
+code execution, DuckDuckGo fallback search, and the on-demand WB indicator
+ingestion endpoint. Shared client instances (Postgres engine, Qdrant,
+OpenAI) are lazily built and cached in the module-level ``_runtime`` dict.
+"""
+
 import asyncio
 import base64
 import json
 import logging
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -19,6 +29,11 @@ _runtime: Dict[str, Any] = {}
 
 MAX_SQL_ROWS = 500
 
+# Connection-pooled HTTP client shared by every backend call (sandbox +
+# downloader_extra). Cuts TLS / TCP handshake from each request and lets httpx
+# reuse keep-alive sockets across the agent's lifetime.
+_HTTPX_LIMITS = httpx.Limits(max_connections=20, max_keepalive_connections=10)
+
 
 def configure_runtime(
     *,
@@ -33,6 +48,24 @@ def configure_runtime(
     openai_base_url: str,
     openai_embedding_model: str,
 ) -> None:
+    """Populate the module-level runtime dict with every external dependency.
+
+    Called once at FastAPI startup; subsequent calls overwrite values. Keeps
+    the worker code free of global state imports — every worker pulls its
+    dependencies from this dict via the lazy getters below.
+
+    Args:
+        database_schema_path: Path to ``database_schema.yaml``.
+        news_topics_path: Path to the JSON list of allowed news topics.
+        qdrant_url: Full ``http(s)://host:port`` URL for Qdrant.
+        qdrant_api_key: Bearer token for Qdrant.
+        postgres_database_uri: SQLAlchemy URI for the read-only LLM role.
+        python_sandbox_base_url: Base URL of the sandbox FastAPI service.
+        downloader_extra_base_url: Base URL of the on-demand WB ingester.
+        openai_api_key: OpenAI-compatible API key.
+        openai_base_url: OpenAI-compatible base URL.
+        openai_embedding_model: Embedding model identifier.
+    """
     _runtime["qdrant_url"] = qdrant_url
     _runtime["qdrant_api_key"] = qdrant_api_key
     _runtime["postgres_database_uri"] = postgres_database_uri
@@ -45,16 +78,19 @@ def configure_runtime(
     _runtime["database_schema"] = yaml.safe_load(
         Path(database_schema_path).read_text(encoding="utf-8")
     )
-    _runtime["news_topics"] = json.loads(
-        Path(news_topics_path).read_text(encoding="utf-8")
-    )
+    _runtime["news_topics"] = json.loads(Path(news_topics_path).read_text(encoding="utf-8"))
 
     _runtime["_engine"] = None
     _runtime["_qdrant_client"] = None
     _runtime["_openai_async_client"] = None
+    _runtime["_httpx_client"] = None
+    # Invalidate the cached schema-text rendering so a YAML reload at runtime
+    # takes effect on the next worker call.
+    get_database_schema_text.cache_clear()
 
 
 def _get_engine():
+    """Return the cached SQLAlchemy engine, building it on first use."""
     if _runtime.get("_engine") is None:
         _runtime["_engine"] = create_engine(
             _runtime["postgres_database_uri"],
@@ -66,6 +102,7 @@ def _get_engine():
 
 
 def _get_qdrant_client() -> QdrantClient:
+    """Return the cached Qdrant HTTP client, building it on first use."""
     if _runtime.get("_qdrant_client") is None:
         _runtime["_qdrant_client"] = QdrantClient(
             url=_runtime["qdrant_url"],
@@ -76,6 +113,7 @@ def _get_qdrant_client() -> QdrantClient:
 
 
 def _get_openai_async_client() -> AsyncOpenAI:
+    """Return the cached async OpenAI client, building it on first use."""
     if _runtime.get("_openai_async_client") is None:
         _runtime["_openai_async_client"] = AsyncOpenAI(
             api_key=_runtime["openai_api_key"],
@@ -84,7 +122,37 @@ def _get_openai_async_client() -> AsyncOpenAI:
     return _runtime["_openai_async_client"]
 
 
+def _get_httpx_client() -> httpx.AsyncClient:
+    """Return the cached connection-pooled async HTTP client.
+
+    A single ``httpx.AsyncClient`` is reused for every call to the
+    ``python_sandbox`` and ``downloader_extra`` services. This avoids the
+    per-request TCP/TLS handshake that ``async with httpx.AsyncClient()``
+    incurred previously and lets ``httpx`` recycle keep-alive sockets.
+    """
+    if _runtime.get("_httpx_client") is None:
+        _runtime["_httpx_client"] = httpx.AsyncClient(limits=_HTTPX_LIMITS)
+    return _runtime["_httpx_client"]
+
+
+async def aclose_runtime_clients() -> None:
+    """Close the cached httpx client. Called from the FastAPI shutdown hook."""
+    client = _runtime.get("_httpx_client")
+    if client is not None:
+        await client.aclose()
+        _runtime["_httpx_client"] = None
+
+
+@lru_cache(maxsize=1)
 def get_database_schema_text() -> str:
+    """Render the YAML schema as a human-readable text block.
+
+    Used by the ``sql_agent`` system prompt so the LLM can ground table /
+    column references without us shipping the raw YAML.
+
+    Returns:
+        Multi-line text describing every database / table / column / FK.
+    """
     schema = _runtime.get("database_schema", {})
     lines: list[str] = []
     for db_name, tables in schema.get("databases", {}).items():
@@ -102,9 +170,7 @@ def get_database_schema_text() -> str:
                 ref_table = fk.get("references_table", "")
                 ref_cols = ", ".join(fk.get("references_columns", []))
                 enforced = "enforced" if fk.get("enforce", True) else "documentation only"
-                lines.append(
-                    f"  Foreign key: ({cols}) -> {ref_table}({ref_cols}) [{enforced}]"
-                )
+                lines.append(f"  Foreign key: ({cols}) -> {ref_table}({ref_cols}) [{enforced}]")
 
             lines.append("  Columns:")
             for col_name, col_info in (table_def.get("columns") or {}).items():
@@ -115,10 +181,25 @@ def get_database_schema_text() -> str:
 
 
 def get_news_topics() -> List[str]:
+    """Return the list of allowed RAG topics loaded from JSON config."""
     return _runtime.get("news_topics", [])
 
 
 def _sync_run_sql_query(sql_query: str) -> Dict[str, Any]:
+    """Run one read-only SQL query and return rows + columns + truncation flag.
+
+    Refuses anything that isn't a ``SELECT`` so the LLM can't accidentally
+    issue DDL through the read-only role. Result rows are capped at
+    ``MAX_SQL_ROWS`` with a ``truncated`` flag so the agent can decide
+    whether to re-query with tighter filters.
+
+    Args:
+        sql_query: The SQL produced by the ``sql_agent`` worker.
+
+    Returns:
+        Dict with ``columns``, ``rows``, ``row_count``, ``truncated`` and
+        ``query`` keys, or an ``error`` key on failure.
+    """
     normalized = sql_query.strip().upper()
     if not normalized.startswith("SELECT"):
         return {"error": "Only SELECT queries are allowed.", "rows": [], "row_count": 0}
@@ -128,9 +209,7 @@ def _sync_run_sql_query(sql_query: str) -> Dict[str, Any]:
         with engine.connect() as conn:
             result = conn.execute(text(sql_query))
             columns = list(result.keys())
-            rows = [
-                dict(zip(columns, row)) for row in result.fetchmany(MAX_SQL_ROWS + 1)
-            ]
+            rows = [dict(zip(columns, row)) for row in result.fetchmany(MAX_SQL_ROWS + 1)]
             truncated = len(rows) > MAX_SQL_ROWS
             if truncated:
                 rows = rows[:MAX_SQL_ROWS]
@@ -154,6 +233,7 @@ def _sync_run_sql_query(sql_query: str) -> Dict[str, Any]:
 
 
 async def run_sql_query(sql_query: str) -> Dict[str, Any]:
+    """Async wrapper around :func:`_sync_run_sql_query` (off-loop)."""
     return await asyncio.to_thread(_sync_run_sql_query, sql_query)
 
 
@@ -161,31 +241,56 @@ async def execute_code_in_sandbox(
     code: str,
     timeout_seconds: int = 60,
 ) -> Dict[str, Any]:
+    """POST ``code`` to the python_sandbox service and return its result.
+
+    Args:
+        code: Python source to run.
+        timeout_seconds: Sandbox-side wall-clock budget.
+
+    Returns:
+        Sandbox response dict (``success`` / ``stdout`` / ``stderr`` / ``returncode``).
+        On HTTP failure, returns a synthetic record with ``success=False`` and
+        ``returncode=-1`` so the LLM can act on the error.
+    """
     url = f"{_runtime['python_sandbox_base_url']}/execute"
     payload = {"code": code, "timeout_seconds": timeout_seconds}
 
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            url, json=payload, timeout=max(timeout_seconds + 10, 70)
-        )
-        if response.status_code != 200:
-            return {
-                "success": False,
-                "stdout": "",
-                "stderr": f"Sandbox HTTP {response.status_code}: {response.text}",
-                "returncode": -1,
-            }
-        return response.json()
+    client = _get_httpx_client()
+    response = await client.post(url, json=payload, timeout=max(timeout_seconds + 10, 70))
+    if response.status_code != 200:
+        return {
+            "success": False,
+            "stdout": "",
+            "stderr": f"Sandbox HTTP {response.status_code}: {response.text}",
+            "returncode": -1,
+        }
+    return response.json()
 
 
 def encode_data_for_sandbox(rows: list[dict]) -> str:
-    """Base64-encode a list of dicts so it can be safely embedded in sandbox code."""
+    """Base64-encode rows so they can be safely interpolated into sandbox code.
+
+    Args:
+        rows: List of row dicts.
+
+    Returns:
+        Base64-encoded UTF-8 JSON string. ``default=str`` is used so datetime
+        and decimal values survive the round-trip.
+    """
     raw = json.dumps(rows, default=str)
     return base64.b64encode(raw.encode()).decode()
 
 
 def _make_collection_name(topic: str, sentiment: str) -> str:
-    """Replicate the collection-naming logic used by the downloader."""
+    """Replicate the Qdrant collection naming used by ``downloader_general``.
+
+    Args:
+        topic: Topic label (e.g. ``Economy Business and Finance``).
+        sentiment: ``positive`` or ``negative``.
+
+    Returns:
+        A Qdrant-safe collection name (lowercased, underscores).
+    """
     topic_normalized = topic.strip().lower()
     name = f"{topic_normalized}_{sentiment}"
     name = name.replace(" ", "_").replace(",", " ").lower()
@@ -193,6 +298,7 @@ def _make_collection_name(topic: str, sentiment: str) -> str:
 
 
 async def _get_embedding(text_input: str) -> List[float]:
+    """Embed one string via the configured OpenAI-compatible model."""
     client = _get_openai_async_client()
     model = _runtime["openai_embedding_model"]
     response = await client.embeddings.create(input=[text_input], model=model)
@@ -205,6 +311,18 @@ def _sync_qdrant_search(
     sentiment_filter: str | None,
     top_k: int,
 ) -> Dict[str, Any]:
+    """Search every relevant Qdrant collection and merge the top ``top_k`` hits.
+
+    Args:
+        query_embedding: Pre-computed embedding for the user query.
+        topic_filter: When set, restrict to ``topic_*`` collections.
+        sentiment_filter: When set, restrict to ``*_sentiment`` collections.
+        top_k: Total number of articles to return after merging collections.
+
+    Returns:
+        Dict with an ``articles`` key listing top results, or a ``message``
+        explaining why no collections matched.
+    """
     qdrant = _get_qdrant_client()
 
     collections_response = qdrant.get_collections()
@@ -221,9 +339,7 @@ def _sync_qdrant_search(
             if name in all_collections:
                 target_collections.append(name)
     elif sentiment_filter:
-        target_collections = [
-            c for c in all_collections if c.endswith(f"_{sentiment_filter}")
-        ]
+        target_collections = [c for c in all_collections if c.endswith(f"_{sentiment_filter}")]
     else:
         target_collections = all_collections
 
@@ -281,6 +397,17 @@ async def search_qdrant_news(
     sentiment_filter: str | None = None,
     top_k: int = 5,
 ) -> Dict[str, Any]:
+    """Embed ``query`` and search Qdrant news collections.
+
+    Args:
+        query: User search string.
+        topic_filter: Optional topic restriction.
+        sentiment_filter: Optional sentiment restriction.
+        top_k: Number of articles to return.
+
+    Returns:
+        Dict with ``articles`` or an ``error`` key.
+    """
     try:
         query_embedding = await _get_embedding(query)
         return await asyncio.to_thread(
@@ -290,12 +417,19 @@ async def search_qdrant_news(
         return {"articles": [], "error": str(exc)}
 
 
-
-
 def _sync_web_search(
     queries: List[str],
     max_results_per_query: int = 5,
 ) -> Dict[str, Any]:
+    """Run one or more DuckDuckGo text searches and collect the hits.
+
+    Args:
+        queries: List of search strings.
+        max_results_per_query: Hits to keep per query.
+
+    Returns:
+        Dict with ``results`` (and an ``error`` key on failure).
+    """
     results: list[dict] = []
     try:
         ddgs = DDGS()
@@ -318,22 +452,31 @@ async def web_search(
     queries: List[str],
     max_results_per_query: int = 5,
 ) -> Dict[str, Any]:
+    """Async wrapper around :func:`_sync_web_search` (off-loop)."""
     return await asyncio.to_thread(_sync_web_search, queries, max_results_per_query)
 
 
-
-
 async def download_indicator(indicator_id: str, db_id: int) -> Dict[str, Any]:
+    """Ask ``downloader_extra`` to ingest one WB indicator into Postgres.
+
+    Args:
+        indicator_id: World Bank indicator id.
+        db_id: World Bank database id.
+
+    Returns:
+        ``downloader_extra``'s ingest response, augmented with ``success=True``,
+        or ``{"success": False, "error": ...}`` on HTTP failure.
+    """
     url = f"{_runtime['downloader_extra_base_url']}/ingest"
     payload = {"indicator_id": indicator_id, "db_id": db_id}
 
-    async with httpx.AsyncClient() as client:
-        response = await client.post(url, json=payload, timeout=120)
-        if response.status_code != 200:
-            return {
-                "success": False,
-                "error": f"HTTP {response.status_code}: {response.text}",
-            }
-        data = response.json()
-        data["success"] = True
-        return data
+    client = _get_httpx_client()
+    response = await client.post(url, json=payload, timeout=120)
+    if response.status_code != 200:
+        return {
+            "success": False,
+            "error": f"HTTP {response.status_code}: {response.text}",
+        }
+    data = response.json()
+    data["success"] = True
+    return data

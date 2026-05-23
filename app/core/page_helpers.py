@@ -5,12 +5,12 @@ page (10× copies of `_prepare_indicator_slice`). Keeping the cleaning
 logic in one place ensures the dashboard pages stay in sync if the
 World Bank schema or our normalization rules ever change.
 """
+
 from __future__ import annotations
 
 import polars as pl
 
 from core.postgres_client import get_world_bank_indicator
-
 
 _REQUIRED_COLUMNS: frozenset[str] = frozenset({"year", "economy", "value"})
 

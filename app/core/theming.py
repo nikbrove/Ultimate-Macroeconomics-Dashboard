@@ -5,6 +5,7 @@ and registers a Plotly template named "app" derived from the active theme.
 The active theme is fixed at deploy time via `themes.yaml` — the dashboard no
 longer exposes a runtime theme picker.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -15,12 +16,12 @@ import plotly.io as pio
 import streamlit as st
 import yaml
 
-
 THEMES_FILENAME = "themes.yaml"
 PLOTLY_TEMPLATE_NAME = "app"
 
 
 def _candidate_themes_paths() -> list[Path]:
+    """Return the ordered list of paths we try when locating ``themes.yaml``."""
     here = Path(__file__).resolve()
     return [
         Path.cwd() / THEMES_FILENAME,
@@ -31,6 +32,7 @@ def _candidate_themes_paths() -> list[Path]:
 
 
 def _resolve_themes_path() -> Path:
+    """Pick the first themes-file path that actually exists; raise when none do."""
     for candidate in _candidate_themes_paths():
         if candidate.is_file():
             return candidate
@@ -42,23 +44,21 @@ def _resolve_themes_path() -> Path:
 
 @st.cache_data(show_spinner=False)
 def load_themes() -> dict:
+    """Load and cache the parsed ``themes.yaml`` document; validate required keys."""
     path = _resolve_themes_path()
     data = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or "themes" not in data or "active" not in data:
-        raise ValueError(
-            f"{path} must contain top-level 'active' and 'themes' keys."
-        )
+        raise ValueError(f"{path} must contain top-level 'active' and 'themes' keys.")
     return data
 
 
 def get_active_theme() -> dict:
+    """Return the theme dict pointed to by the ``active:`` key in ``themes.yaml``."""
     data = load_themes()
     name = data["active"]
     themes = data["themes"]
     if name not in themes:
-        raise KeyError(
-            f"Active theme '{name}' is not defined. Available: {list(themes.keys())}"
-        )
+        raise KeyError(f"Active theme '{name}' is not defined. Available: {list(themes.keys())}")
     return themes[name]
 
 
@@ -70,13 +70,13 @@ def get_color(token: str) -> str:
     semantic = get_active_theme().get("semantic") or {}
     if token not in semantic:
         raise KeyError(
-            f"Unknown color token '{token}'. Defined in active theme: "
-            f"{sorted(semantic.keys())}"
+            f"Unknown color token '{token}'. Defined in active theme: {sorted(semantic.keys())}"
         )
     return str(semantic[token])
 
 
 def get_colorway() -> list[str]:
+    """Return the categorical colour list used by Plotly traces in the active theme."""
     return list(get_active_theme().get("plotly", {}).get("colorway") or [])
 
 
@@ -92,6 +92,20 @@ def get_diverging_colorscale(reverse: bool = False) -> list[list[float | str]]:
     if reverse:
         low, high = high, low
     return [[0.0, low], [0.5, mid], [1.0, high]]
+
+
+def get_sequential_colorscale(reverse: bool = False) -> list[list[float | str]]:
+    """Return a 2-stop sequential Plotly colorscale from the active theme."""
+    low = get_color("sequential_low")
+    high = get_color("sequential_high")
+    if reverse:
+        low, high = high, low
+    return [[0.0, low], [1.0, high]]
+
+
+def get_confidence_band_alpha() -> float:
+    """Return the opacity used for forecast confidence bands in the active theme."""
+    return float(get_color("confidence_band_alpha"))
 
 
 def register_plotly_template() -> None:

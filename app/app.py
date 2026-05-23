@@ -1,3 +1,12 @@
+"""Streamlit entry point: page config, navigation, and one-time bootstrap.
+
+Streamlit re-executes this module from top to bottom on every interaction,
+so all expensive work lives behind ``st.cache_*`` decorators in
+``core/``. This file only sets the page config, registers the Plotly
+template, initialises ``st.session_state``, defines the multi-page nav,
+and shows the data disclaimer dialog on first visit.
+"""
+
 import streamlit as st
 
 from core.theming import register_plotly_template
@@ -15,6 +24,12 @@ register_plotly_template()
 
 
 def init_global_state():
+    """Initialise the cross-page session-state entries the first time the app loads.
+
+    Streamlit clears ``session_state`` only on browser disconnect, so this
+    runs once per user session. Holds the chat history and the per-service
+    health flags consumed by the Monitoring page.
+    """
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
 
@@ -31,6 +46,14 @@ def init_global_state():
 
 
 def setup_routing():
+    """Declare every ``st.Page`` and group them into the sidebar navigation.
+
+    Page-file order (``01_…`` through ``18_…``) drives the in-group order
+    while the dict keys define the section labels in the sidebar.
+
+    Returns:
+        The configured ``st.navigation`` object ready to ``.run()``.
+    """
     p_basic_indicators = st.Page(
         "pages/01_basic_indicators.py", title="General Economics Indicators", icon="📈"
     )
@@ -63,14 +86,11 @@ def setup_routing():
     p_custom_plot = st.Page(
         "pages/12_custom_plot_builder.py", title="Custom Plot Constructor", icon="📊"
     )
-    p_cluster = st.Page(
-        "pages/13_clustering_sandbox.py", title="Clustering Sandbox", icon="🔍"
-    )
-    p_yahoo_finance = st.Page(
-        "pages/14_yahoo_finance.py", title="Yahoo Finance", icon="💹"
-    )
+    p_cluster = st.Page("pages/13_clustering_sandbox.py", title="Clustering Sandbox", icon="🔍")
+    p_yahoo_finance = st.Page("pages/14_yahoo_finance.py", title="Yahoo Finance", icon="💹")
     p_news = st.Page("pages/15_news.py", title="News Explorer", icon="📰")
-    p_settings = st.Page("pages/16_settings.py", title="System Settings", icon="⚙️")
+    p_token_usage = st.Page("pages/17_token_usage.py", title="Token Usage", icon="🪙")
+    p_monitoring = st.Page("pages/18_monitoring.py", title="Monitoring", icon="🛰️")
 
     pg = st.navigation(
         {
@@ -89,7 +109,7 @@ def setup_routing():
             "Other data": [p_yahoo_finance, p_news],
             "Constructors": [p_custom_plot, p_cluster],
             "AI": [p_agent],
-            "Settings": [p_settings],
+            "Settings": [p_token_usage, p_monitoring],
         }
     )
 
@@ -97,11 +117,13 @@ def setup_routing():
 
 
 def _show_data_disclaimer():
+    """Show the data-disclaimer dialog once per session and remember acceptance."""
     if st.session_state.get("disclaimer_accepted"):
         return
 
     @st.dialog("Data Disclaimer", width="large")
     def _disclaimer_dialog():
+        """Render the disclaimer dialog body; flip the session flag on accept."""
         st.warning(
             "**Important:** The developer of this dashboard is not responsible for "
             "the accuracy, completeness, or quality of the data and news displayed. "

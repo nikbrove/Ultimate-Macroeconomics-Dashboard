@@ -15,6 +15,7 @@ dependencies = [
     "connectorx==0.4.5",
     "gitdb==4.0.12",
     "gitpython==3.1.46",
+    "httpx==0.28.1",
     "idna==3.11",
     "jinja2==3.1.6",
     "jsonschema==4.26.0",
@@ -31,18 +32,19 @@ dependencies = [
     "polars==1.38.1",
     "polars-runtime-32==1.38.1",
     "protobuf==6.33.5",
+    "psycopg2-binary==2.9.11",
     "pyarrow==23.0.1",
     "pydeck==0.9.1",
     "python-dateutil==2.9.0.post0",
     "python-dotenv==1.2.1",
     "pytz==2026.1.post1",
     "referencing==0.37.0",
-    "requests==2.32.5",
     "qdrant-client==1.17.0",
     "pyyaml==6.0.3",
     "rpds-py==0.30.0",
     "six==1.17.0",
     "smmap==5.0.2",
+    "sqlalchemy==2.0.48",
     "streamlit==1.55.0",
     "tenacity==9.1.4",
     "toml==0.10.2",
@@ -63,3 +65,54 @@ bypass-selection = true
 
 [tool.uv]
 package = false
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.14",
+    "ty>=0.0.39",
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra --strict-markers --cov --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["app.py", "core", "pages"]
+branch = true
+omit = ["tests/*", "**/__init__.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.ty.environment]
+python-version = "3.12"
+
+[tool.ty.rules]
+unresolved-import = "ignore"
+no-matching-overload = "ignore"
+unknown-argument = "ignore"
+unresolved-attribute = "warn"
+invalid-argument-type = "warn"
+invalid-assignment = "warn"

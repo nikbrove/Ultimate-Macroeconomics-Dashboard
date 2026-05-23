@@ -1,24 +1,33 @@
+"""World Bank ingestion pipeline.
+
+Fetches the catalogue of databases and indicators, then walks every indicator
+configured under ``world_bank_download_config.json`` in parallel, downloading
+both metadata (units, source notes) and data (per economy/year cells). Falls
+back from ``wbgapi`` to the raw v2 REST endpoint when the former returns empty.
+"""
+
+import logging
 import os
 import sys
-import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from time import sleep
 from typing import Any, Dict, Optional
 
+import httpx
 import polars as pl
-import requests
 import wbgapi as wb
 from dotenv import load_dotenv
 from tqdm import tqdm
 
+from src.core.base_downloaders import BaseWorldBankDownloader
 from src.utils.downloads import (
+    _call_with_retries,
+    _download_config,
+    _download_source_indicators,
     _get_sql_config,
+    _polars_from_world_bank_records,
     _test_sql,
     _test_world_bank_api,
-    _download_config,
-    _call_with_retries,
-    _polars_from_world_bank_records,
-    _download_source_indicators,
 )
 from src.utils.schema import (
     bootstrap_schema_group,
@@ -26,13 +35,11 @@ from src.utils.schema import (
     write_polars_to_table,
 )
 
-from src.core.base_downloaders import BaseWorldBankDownloader
-
 logger = logging.getLogger(__name__)
 
 
 class WorldBankDownloader(BaseWorldBankDownloader):
-    """Downloader for World Bank data"""
+    """Concrete World Bank downloader that writes to Postgres via Polars."""
 
     SCHEMA_GROUP = "world_bank"
 
@@ -42,6 +49,14 @@ class WorldBankDownloader(BaseWorldBankDownloader):
         download_config_path: str | Path | None = None,
         database_schema: Optional[Dict[str, Any]] = None,
     ) -> None:
+        """Capture configuration; the Postgres URI is built in ``_initialize_connections``.
+
+        Args:
+            env_path: Path to the ``.env`` with Postgres credentials.
+            download_config_path: JSON file listing the indicators to fetch.
+            database_schema: Parsed schema dict so this downloader can look
+                up the canonical column list/dtypes for its tables.
+        """
         self.env_path = Path(env_path)
         self.download_config = _download_config(download_config_path)
         self.sql_uri = None
@@ -56,7 +71,9 @@ class WorldBankDownloader(BaseWorldBankDownloader):
 
         self.download_max_retries = 3
         self.download_retry_delay_seconds = 5
-        self.between_download_sleep_seconds = 10
+        # Polite ceiling on parallel WB API calls; the API tolerates a handful
+        # of concurrent requests but starts rate-limiting beyond that.
+        self.max_parallel_indicators = 4
 
     def _table_def(self, table_name: str) -> Dict[str, Any]:
         return get_table_definition(self.database_schema, self.SCHEMA_GROUP, table_name)
@@ -83,41 +100,46 @@ class WorldBankDownloader(BaseWorldBankDownloader):
         Uses the standard WB v2 /country/all/indicator/{id}?source={db} endpoint instead."""
         rows = []
         page = 1
-        while True:
-            resp = requests.get(
-                f"https://api.worldbank.org/v2/country/all/indicator/{indicator_id}",
-                params={"source": db, "format": "json", "per_page": 1000, "page": page},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            payload = resp.json()
-            if not isinstance(payload, list) or len(payload) < 2 or payload[1] is None:
-                break
-            meta, records = payload[0], payload[1]
-            for r in records:
-                iso3 = r.get("countryiso3code", "")
-                if len(iso3) != 3:
-                    continue
-                if r.get("value") is None:
-                    continue
-                try:
-                    year = int(r["date"])
-                except (ValueError, TypeError):
-                    continue
-                rows.append({"economy": iso3, "time": year, "value": r["value"]})
-            if page >= int(meta.get("pages", 1)):
-                break
-            page += 1
+        with httpx.Client(timeout=30.0) as client:
+            while True:
+                resp = client.get(
+                    f"https://api.worldbank.org/v2/country/all/indicator/{indicator_id}",
+                    params={
+                        "source": db,
+                        "format": "json",
+                        "per_page": 1000,
+                        "page": page,
+                    },
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+                if not isinstance(payload, list) or len(payload) < 2 or payload[1] is None:
+                    break
+                meta, records = payload[0], payload[1]
+                for r in records:
+                    iso3 = r.get("countryiso3code", "")
+                    if len(iso3) != 3:
+                        continue
+                    if r.get("value") is None:
+                        continue
+                    try:
+                        year = int(r["date"])
+                    except (ValueError, TypeError):
+                        continue
+                    rows.append({"economy": iso3, "time": year, "value": r["value"]})
+                if page >= int(meta.get("pages", 1)):
+                    break
+                page += 1
         return rows or None
 
     def _fetch_indicator_metadata_via_api(self, indicator_id: str, db: int) -> Optional[dict]:
         """Fallback metadata for sources where wbgapi's /sources/{db}/series/... URL fails.
         Uses the standard WB v2 /indicator/{id} endpoint instead."""
-        resp = requests.get(
-            f"https://api.worldbank.org/v2/indicator/{indicator_id}",
-            params={"format": "json", "source": db},
-            timeout=30,
-        )
+        with httpx.Client(timeout=30.0) as client:
+            resp = client.get(
+                f"https://api.worldbank.org/v2/indicator/{indicator_id}",
+                params={"format": "json", "source": db},
+            )
         resp.raise_for_status()
         payload = resp.json()
         if not isinstance(payload, list) or len(payload) < 2 or not payload[1]:
@@ -158,7 +180,9 @@ class WorldBankDownloader(BaseWorldBankDownloader):
             retry_delay_seconds=self.download_retry_delay_seconds,
         )
         if country_records is None:
-            logger.warning("Skipping countries table download: economy.list failed after all retries")
+            logger.warning(
+                "Skipping countries table download: economy.list failed after all retries"
+            )
             return
         df_countries = _polars_from_world_bank_records(country_records)
         write_polars_to_table(
@@ -171,7 +195,9 @@ class WorldBankDownloader(BaseWorldBankDownloader):
 
         logger.info("Starting download of World Bank source indicators")
         source_ids = df.get_column("id").to_list()
-        for source_id in tqdm(source_ids, desc="Downloading source indicators", dynamic_ncols=True, file=sys.stdout):
+        for source_id in tqdm(
+            source_ids, desc="Downloading source indicators", dynamic_ncols=True, file=sys.stdout
+        ):
             _download_source_indicators(
                 db_id=source_id,
                 sql_uri=self.sql_uri,
@@ -189,15 +215,17 @@ class WorldBankDownloader(BaseWorldBankDownloader):
         )
         data_records = _call_with_retries(
             operation_name=f"data.fetch(indicator_id={indicator_id}, db={db})",
-            request_callable=lambda: list(wb.data.fetch(
-                indicator_id,
-                db=db,
-                skipAggs=True,
-                economy="all",
-                time="all",
-                skipBlanks=False,
-                numericTimeKeys=True,
-            )),
+            request_callable=lambda: list(
+                wb.data.fetch(
+                    indicator_id,
+                    db=db,
+                    skipAggs=True,
+                    economy="all",
+                    time="all",
+                    skipBlanks=False,
+                    numericTimeKeys=True,
+                )
+            ),
             max_retries=self.download_max_retries,
             retry_delay_seconds=self.download_retry_delay_seconds,
         )
@@ -205,7 +233,8 @@ class WorldBankDownloader(BaseWorldBankDownloader):
         if data_records is None:
             logger.info(
                 "Trying fallback API endpoint for indicator data (indicator_id=%s, db=%s)",
-                indicator_id, db,
+                indicator_id,
+                db,
             )
             data_records = _call_with_retries(
                 operation_name=f"data.fetch.api(indicator_id={indicator_id}, db={db})",
@@ -217,7 +246,9 @@ class WorldBankDownloader(BaseWorldBankDownloader):
         if data_records is None:
             logger.warning(
                 "Skipping indicator data download after all retries failed "
-                "(indicator_id=%s, db=%s)", indicator_id, db
+                "(indicator_id=%s, db=%s)",
+                indicator_id,
+                db,
             )
             return
 
@@ -232,14 +263,18 @@ class WorldBankDownloader(BaseWorldBankDownloader):
         economy_column = "economy"
         year_column = "time"
 
-        df = df.select([
-            pl.col(economy_column).alias("economy"),
-            pl.col(year_column).alias("year"),
-            pl.col("value"),
-        ]).with_columns([
-            pl.lit(indicator_id).alias("indicator_id"),
-            pl.lit(db).alias("db_id"),
-        ])
+        df = df.select(
+            [
+                pl.col(economy_column).alias("economy"),
+                pl.col(year_column).alias("year"),
+                pl.col("value"),
+            ]
+        ).with_columns(
+            [
+                pl.lit(indicator_id).alias("indicator_id"),
+                pl.lit(db).alias("db_id"),
+            ]
+        )
         df = df.drop_nulls(subset=["economy", "year"]).unique(
             subset=["economy", "year", "indicator_id", "db_id"],
             keep="last",
@@ -260,7 +295,6 @@ class WorldBankDownloader(BaseWorldBankDownloader):
         logger.info(
             f"Finished download of World Bank indicator data (indicator_id={indicator_id}, db={db})"
         )
-        sleep(self.between_download_sleep_seconds)
 
     def download_metadata(self, indicator_id: str, db: int) -> None:
         logger.info(
@@ -283,12 +317,15 @@ class WorldBankDownloader(BaseWorldBankDownloader):
                 "source": metadata.get("Source"),
                 "development_relevance": metadata.get("Developmentrelevance"),
                 "limitations_and_exceptions": metadata.get("Limitationsandexceptions"),
-                "statistical_concept_and_methodology": metadata.get("Statisticalconceptandmethodology"),
+                "statistical_concept_and_methodology": metadata.get(
+                    "Statisticalconceptandmethodology"
+                ),
             }
         else:
             logger.info(
                 "Trying fallback metadata endpoint for indicator (indicator_id=%s, db=%s)",
-                indicator_id, db,
+                indicator_id,
+                db,
             )
             fallback = _call_with_retries(
                 operation_name=f"indicator.metadata.get(indicator_id={indicator_id}, db={db})",
@@ -298,8 +335,9 @@ class WorldBankDownloader(BaseWorldBankDownloader):
             )
             if fallback is None:
                 logger.warning(
-                    "Skipping metadata download after all retries failed "
-                    "(indicator_id=%s, db=%s)", indicator_id, db,
+                    "Skipping metadata download after all retries failed (indicator_id=%s, db=%s)",
+                    indicator_id,
+                    db,
                 )
                 return
             dataframe_dict = {"indicator_id": indicator_id, "db_id": db, **fallback}
@@ -318,25 +356,42 @@ class WorldBankDownloader(BaseWorldBankDownloader):
         logger.info(
             f"Finished download of World Bank indicator metadata (indicator_id={indicator_id}, db={db})"
         )
-        sleep(self.between_download_sleep_seconds)
+
+    def _download_indicator_pair(self, indicator_id: str, db_id: int) -> None:
+        """Run metadata + data download for a single indicator (worker unit)."""
+        self.download_metadata(indicator_id, db_id)
+        self.download_db(indicator_id, db_id)
 
     def run(self) -> None:
         bootstrap_schema_group(self.sql_uri, self.database_schema, self.SCHEMA_GROUP)
         self.download_basic_tables()
-        download_dictionary = {}
+        download_dictionary: dict[int, list[str]] = {}
         for category in self.download_config:
             for db in self.download_config[category]:
                 db_id = db["db"]
                 download_dictionary.setdefault(db_id, []).append(db["id"])
 
-        for db_id in download_dictionary:
+        for db_id, indicator_ids in download_dictionary.items():
             logging.info(f"Starting downloads for World Bank database (db_id={db_id})")
-            for indicator_id in tqdm(
-                download_dictionary[db_id],
-                desc=f"Downloading indicators for db_id={db_id}",
-                dynamic_ncols=True,
-                file=sys.stdout,
-            ):
-                self.download_metadata(indicator_id, db_id)
-                self.download_db(indicator_id, db_id)
+            with ThreadPoolExecutor(max_workers=self.max_parallel_indicators) as executor:
+                futures = {
+                    executor.submit(self._download_indicator_pair, indicator_id, db_id): indicator_id
+                    for indicator_id in indicator_ids
+                }
+                for future in tqdm(
+                    as_completed(futures),
+                    total=len(futures),
+                    desc=f"Downloading indicators for db_id={db_id}",
+                    dynamic_ncols=True,
+                    file=sys.stdout,
+                ):
+                    indicator_id = futures[future]
+                    try:
+                        future.result()
+                    except Exception:
+                        logger.exception(
+                            "Indicator download failed (indicator_id=%s, db_id=%s)",
+                            indicator_id,
+                            db_id,
+                        )
             logger.info(f"Finished downloads for World Bank database (db_id={db_id})")

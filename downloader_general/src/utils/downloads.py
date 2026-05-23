@@ -1,49 +1,70 @@
-import os
-import sys
-import stat
-from pathlib import Path
+"""Shared utilities for the World Bank / Yahoo / news downloaders.
 
-from tqdm import tqdm
-from git import RemoteProgress
-from sqlalchemy import create_engine, text
+Holds retry wrappers, connectivity probes, schema-flattening helpers, and the
+git ``CloneProgress`` adapter that pipes git-clone telemetry into a tqdm bar.
+"""
 
 import json
 import logging
-import wbgapi as wb
-import polars as pl
-
-from typing import Any, Callable, Dict, Optional
-
+import os
+import stat
+import sys
+from pathlib import Path
 from time import sleep
+from typing import Any, Callable, Dict, Iterable, Optional
+
+import polars as pl
+import wbgapi as wb
+from git import RemoteProgress
+from sqlalchemy import create_engine, text
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
 
 def _remove_readonly(func, path, exc_info):
-    """Clear the read-only bit and retry the removal (for git files on Windows)."""
+    """``shutil.rmtree`` error handler: clear read-only bit and retry.
+
+    The git working tree on Windows contains files with the read-only bit
+    set (under ``.git/objects/`` notably); the standard ``rmtree`` cannot
+    delete them until that bit is cleared.
+
+    Args:
+        func: The failed function (typically ``os.unlink``).
+        path: Filesystem path the failure was on.
+        exc_info: Original exception info (unused).
+    """
     os.chmod(path, stat.S_IWRITE)
     func(path)
 
 
 class CloneProgress(RemoteProgress):
-    """
-    Subclasses GitPython's RemoteProgress to route git cloning
-    telemetry directly into a visual tqdm progress bar.
-    """
+    """Pipe GitPython clone progress events into a tqdm progress bar."""
 
     def __init__(self):
+        """Initialise the underlying ``RemoteProgress`` and tqdm bar."""
         super().__init__()
-        self.pbar = tqdm(desc="Cloning Repository", unit="operations", dynamic_ncols=True, file=sys.stdout)
+        self.pbar = tqdm(
+            desc="Cloning Repository", unit="operations", dynamic_ncols=True, file=sys.stdout
+        )
 
     def update(
         self,
         op_code: int,
-        cur_count: int,
-        max_count: Optional[int] = None,
+        cur_count: str | float,
+        max_count: str | float | None = None,
         message: str = "",
     ) -> None:
-        self.pbar.total = max_count
-        self.pbar.n = cur_count
+        """Push one clone-progress sample into the tqdm bar.
+
+        Args:
+            op_code: GitPython operation code (unused — we just update totals).
+            cur_count: Current operation count.
+            max_count: Total operation count, or ``None`` when unknown.
+            message: Optional human-readable status (unused).
+        """
+        self.pbar.total = float(max_count) if max_count is not None else None
+        self.pbar.n = float(cur_count)
         self.pbar.refresh()
 
 
@@ -53,7 +74,19 @@ def _call_with_retries(
     retry_delay_seconds: float,
     max_retries: int,
 ):
-    """Call a request function with retries and logging."""
+    """Call ``request_callable`` with bounded retry-on-exception.
+
+    Args:
+        operation_name: Label used in log messages so failures can be traced.
+        request_callable: Zero-arg callable that performs the request.
+        retry_delay_seconds: Sleep between attempts.
+        max_retries: Number of retries *after* the first attempt — total
+            attempts will be ``max_retries + 1``.
+
+    Returns:
+        Whatever ``request_callable`` returns on success, or ``None`` if every
+        attempt raised.
+    """
     attempt = 0
 
     while attempt <= max_retries:
@@ -80,7 +113,15 @@ def _call_with_retries(
 
 
 def _flatten_record(record: dict) -> dict:
-    """Flatten one-level nested dictionaries from World Bank API responses."""
+    """Flatten one-level nested dicts to ``parent.child`` keys.
+
+    Args:
+        record: One record from a WB API response.
+
+    Returns:
+        Dict with nested fields renamed (e.g. ``region.value``) and leaf
+        scalars preserved as-is.
+    """
     flattened = {}
     for key, value in record.items():
         if isinstance(value, dict):
@@ -92,12 +133,27 @@ def _flatten_record(record: dict) -> dict:
 
 
 def _polars_from_world_bank_records(records: Optional[object]) -> pl.DataFrame:
-    """Convert World Bank API iterables/custom objects to a Polars DataFrame."""
+    """Convert a wbgapi iterable (or pre-built frame) into Polars.
+
+    Tolerates already-built DataFrames, ``None`` (empty frame), and arbitrary
+    iterables of dicts or non-dict scalars; flattens one level of nested
+    dictionaries via :func:`_flatten_record`.
+
+    Args:
+        records: WB response — DataFrame, iterable, or None.
+
+    Returns:
+        Polars DataFrame; empty when ``records`` is None or yields no rows.
+    """
     if isinstance(records, pl.DataFrame):
         return records
 
+    if records is None:
+        return pl.DataFrame()
+
+    iterable_records: Iterable[Any] = records  # type: ignore[assignment]
     rows = []
-    for record in records:
+    for record in iterable_records:
         if isinstance(record, dict):
             rows.append(_flatten_record(record))
         else:
@@ -117,7 +173,20 @@ def _download_source_indicators(
     api_max_retries: int,
     api_retry_delay_seconds: float,
 ) -> bool:
-    """Download indicators for a given World Bank database and save to `PostgreSQL`"""
+    """Pull the indicator catalogue for one WB database into Postgres.
+
+    Args:
+        db_id: World Bank database id.
+        sql_uri: Postgres URI to write to.
+        table_name: Destination table.
+        table_def: Schema definition (column types + PKs) for ``table_name``.
+        api_max_retries: Retry budget for the underlying WB call.
+        api_retry_delay_seconds: Sleep between WB-call retries.
+
+    Returns:
+        ``True`` on success (including the "no rows" case); ``False`` when
+        all retries failed.
+    """
     from src.utils.schema import write_polars_to_table
 
     indicator_records = _call_with_retries(
@@ -128,17 +197,13 @@ def _download_source_indicators(
     )
 
     if indicator_records is None:
-        logger.warning(
-            "Skipping source indicators for db_id=%s after all retries failed", db_id
-        )
+        logger.warning("Skipping source indicators for db_id=%s after all retries failed", db_id)
         return False
 
     df_indicators = _polars_from_world_bank_records(indicator_records)
 
     if df_indicators.is_empty():
-        logger.info(
-            "No indicators returned for db_id=%s; skipping write", db_id
-        )
+        logger.info("No indicators returned for db_id=%s; skipping write", db_id)
         return True
 
     df_indicators = df_indicators.with_columns(pl.lit(db_id).alias("database_id"))
@@ -153,12 +218,30 @@ def _download_source_indicators(
 
 
 def _download_config(path: str | Path) -> dict:
-    """Download config for downloads"""
+    """Read and parse a JSON download-config file.
+
+    Args:
+        path: Path to the JSON file.
+
+    Returns:
+        Parsed JSON as a Python dict.
+    """
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
 def _get_sql_config(username: str, password: str, host: str, port: int, db: str) -> str:
-    """Download config from .env for setting up an connection with `PostgreSQL`"""
+    """Assemble a ``postgresql://...`` URI from individual parts.
+
+    Args:
+        username: Postgres username.
+        password: Postgres password.
+        host: Postgres host (container name in Compose).
+        port: Postgres port.
+        db: Database name; pass an empty string for the cluster-level URI.
+
+    Returns:
+        Connection URI string suitable for SQLAlchemy / psycopg.
+    """
     if db:
         uri = f"postgresql://{username}:{password}@{host}:{port}/{db}"
     else:
@@ -167,7 +250,14 @@ def _get_sql_config(username: str, password: str, host: str, port: int, db: str)
 
 
 def _test_sql(uri: str) -> bool:
-    """Test if provided connection string works correct"""
+    """Probe a Postgres connection with ``SELECT 1``.
+
+    Args:
+        uri: SQLAlchemy URI.
+
+    Returns:
+        ``True`` if the probe returned ``1``; ``False`` on any error.
+    """
     try:
         with create_engine(uri).connect() as connection:
             _test = connection.execute(text("SELECT 1 AS number")).scalar_one()
@@ -179,13 +269,17 @@ def _test_sql(uri: str) -> bool:
 
 
 def _test_world_bank_api() -> bool:
-    """Test if connection to `world-bank` can be established"""
+    """Probe the World Bank API by calling ``wb.source.list()``.
+
+    Returns:
+        ``True`` if the call returned any rows; ``False`` on any error.
+    """
     try:
         _records = _call_with_retries(
             operation_name="source.list",
             request_callable=lambda: list(wb.source.list()),
-            max_retries=2,
-            retry_delay_seconds=1.0,
+            max_retries=4,
+            retry_delay_seconds=5.0,
         )
         if _records is None:
             return False

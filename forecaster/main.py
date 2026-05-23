@@ -1,16 +1,26 @@
+"""FastAPI service exposing pmdarima / Prophet / Chronos time-series forecasting.
+
+Heavy ML imports happen lazily inside :func:`_get_forecaster` so the container
+boots fast even when only a subset of models is enabled. Each model is
+instantiated at most once per process; subsequent requests reuse the cached
+instance behind an ``asyncio.Lock`` that protects the first-call race.
+"""
+
 import asyncio
+import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import polars as pl
 import yaml
-
 from fastapi import FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
 
-from schemas import ForecastPoint, ForecastRequest, ForecastResponse
 from forecasters.core.base import BaseForecaster
+from schemas import ForecastPoint, ForecastRequest, ForecastResponse
+
+logger = logging.getLogger(__name__)
 
 CONFIG_PATH = Path(os.environ.get("FORECASTER_CONFIG_PATH", "config.yaml"))
 
@@ -25,13 +35,24 @@ CHRONOS_DEFAULT_MODEL_NAME = "amazon/chronos-t5-small"
 
 
 async def _get_forecaster(app: FastAPI, model_type: str) -> BaseForecaster:
-    """Return a cached forecaster, lazily importing+constructing under a lock.
+    """Return a cached forecaster, lazily importing + constructing under a lock.
 
     Without the lock, two concurrent first-time requests for the same model
     would each import the heavy ML library (prophet, chronos…) and race on
     the dict assignment. The lock makes initialization atomic across the
     asyncio event loop. Heavy fit/predict still runs off-loop via
     ``run_in_threadpool``.
+
+    Args:
+        app: FastAPI instance whose ``state.model_cache`` holds the singletons.
+        model_type: ``prophet`` / ``chronos`` / ``arima``.
+
+    Returns:
+        A ready-to-use :class:`BaseForecaster` subclass.
+
+    Raises:
+        HTTPException: 400 when the requested model is disabled or unknown;
+            500 when the underlying library fails to import or instantiate.
     """
     cache: dict[str, BaseForecaster] = app.state.model_cache
     lock: asyncio.Lock = app.state.model_cache_lock
@@ -70,9 +91,7 @@ async def _get_forecaster(app: FastAPI, model_type: str) -> BaseForecaster:
                     detail=f"Failed to initialize Chronos forecaster: {str(e)}",
                 )
             cache["chronos"] = (
-                ChronosForecaster(CHRONOS_MODEL_NAME)
-                if CHRONOS_MODEL_NAME
-                else ChronosForecaster()
+                ChronosForecaster(CHRONOS_MODEL_NAME) if CHRONOS_MODEL_NAME else ChronosForecaster()
             )
             return cache["chronos"]
 
@@ -99,8 +118,28 @@ async def _get_forecaster(app: FastAPI, model_type: str) -> BaseForecaster:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Initialise the per-process model cache and lock on startup.
+
+    Chronos is eagerly loaded onto RAM/GPU at boot so the first inference
+    request doesn't pay the multi-second checkpoint-download + weight-load
+    cost. ARIMA/Prophet stay lazy since they are cheap to construct.
+    """
     app.state.model_cache = {}
     app.state.model_cache_lock = asyncio.Lock()
+
+    if CHRONOS_AVAILABLE:
+        try:
+            from forecasters.chronos_model import ChronosForecaster
+
+            chronos_label = CHRONOS_MODEL_NAME or CHRONOS_DEFAULT_MODEL_NAME
+            logger.info("Preloading Chronos pipeline: %s", chronos_label)
+            app.state.model_cache["chronos"] = await run_in_threadpool(
+                ChronosForecaster, CHRONOS_MODEL_NAME
+            ) if CHRONOS_MODEL_NAME else await run_in_threadpool(ChronosForecaster)
+            logger.info("Chronos pipeline ready (%s)", chronos_label)
+        except Exception as exc:
+            logger.warning("Failed to preload Chronos on startup: %s", exc, exc_info=True)
+
     yield
 
 
@@ -113,16 +152,23 @@ app = FastAPI(
 
 @app.get("/")
 def root() -> dict[str, str]:
+    """Return a static welcome banner — used as a liveness signal."""
     return {"message": "Welcome to the Time Series Forecasting API"}
 
 
 @app.get("/health")
 def health_check() -> dict[str, str]:
+    """Return ``{"status": "ok"}`` for the Compose healthcheck."""
     return {"status": "ok"}
 
 
 @app.get("/models")
 def list_models() -> dict[str, list[str]]:
+    """Return the labels of every enabled model.
+
+    Chronos additionally embeds the underlying checkpoint name in parentheses
+    so the dashboard can show which weights are loaded.
+    """
     available_models: list[str] = []
     if ARIMA_AVAILABLE:
         available_models.append("arima")
@@ -137,6 +183,18 @@ def list_models() -> dict[str, list[str]]:
 
 @app.post("/predict", response_model=ForecastResponse)
 async def generate_prediction(request: ForecastRequest) -> ForecastResponse:
+    """Build a forecast for the supplied history using the requested model.
+
+    Args:
+        request: Validated :class:`ForecastRequest` body.
+
+    Returns:
+        ForecastResponse with the model label and predicted points.
+
+    Raises:
+        HTTPException: 400 for unparseable dates or invalid inputs;
+            500 if the underlying model raises during fit/predict.
+    """
     df = pl.DataFrame({"ds": request.dates, "y": request.values}).with_columns(
         pl.col("ds").str.to_datetime(strict=False)
     )
@@ -166,15 +224,11 @@ async def generate_prediction(request: ForecastRequest) -> ForecastResponse:
     except HTTPException:
         raise
     except ValueError as e:
-        raise HTTPException(
-            status_code=400, detail=f"Invalid forecasting input: {str(e)}"
-        )
+        raise HTTPException(status_code=400, detail=f"Invalid forecasting input: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Forecasting failed: {str(e)}")
 
-    forecast_df = forecast_df.with_columns(
-        pl.col("ds").dt.strftime("%Y-%m-%d %H:%M:%S")
-    )
+    forecast_df = forecast_df.with_columns(pl.col("ds").dt.strftime("%Y-%m-%d %H:%M:%S"))
 
     points = [ForecastPoint(**row) for row in forecast_df.to_dicts()]
 

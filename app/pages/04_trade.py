@@ -1,22 +1,28 @@
-import plotly.express as px
+"""Trade and external sector page — imports/exports, balance, composition.
+
+Around the standard cards this page adds an imports × exports scatter
+(highlighting net importers vs exporters) and a deeper export-composition
+view broken down by category.
+"""
+
 import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
 
 from core.page_helpers import fetch_indicator_slice
 from core.plotting import apply_plotly_theme
-from core.theming import get_color
 from core.postgres_client import (
     get_world_bank_country_mapping,
 )
-from pages.page_utils import render_page_from_config
-
+from core.theming import get_color, get_diverging_colorscale
+from pages.page_utils import get_shared_selected_countries, render_page_from_config
 
 IMPORT_INDICATOR_ID = "NE.IMP.GNFS.ZS"
 EXPORT_INDICATOR_ID = "NE.EXP.GNFS.ZS"
 
 
 def _render_import_export_scatter() -> None:
+    """Render the imports × exports (%-of-GDP) scatter block at the top of the page."""
     st.subheader("Imports vs Exports Scatter")
     st.caption(
         "Compares imports and exports of goods and services as percent of GDP for "
@@ -27,9 +33,7 @@ def _render_import_export_scatter() -> None:
     exports_df = fetch_indicator_slice(EXPORT_INDICATOR_ID, value_col="exports_pct_gdp")
 
     if imports_df.is_empty() or exports_df.is_empty():
-        st.info(
-            "Import-export scatterplot is unavailable because source data is empty."
-        )
+        st.info("Import-export scatterplot is unavailable because source data is empty.")
         st.divider()
         return
 
@@ -40,9 +44,7 @@ def _render_import_export_scatter() -> None:
         return
 
     country_map = get_world_bank_country_mapping()
-    if not country_map.is_empty() and {"id", "value"}.issubset(
-        set(country_map.columns)
-    ):
+    if not country_map.is_empty() and {"id", "value"}.issubset(set(country_map.columns)):
         country_map = country_map.select(
             [
                 pl.col("id").cast(pl.Utf8).str.to_uppercase().alias("economy"),
@@ -54,15 +56,11 @@ def _render_import_export_scatter() -> None:
     joined_df = joined_df.with_columns(
         [
             pl.col("country_name").fill_null(pl.col("economy")).alias("country_name"),
-            (pl.col("exports_pct_gdp") - pl.col("imports_pct_gdp")).alias(
-                "net_external_pct_gdp"
-            ),
+            (pl.col("exports_pct_gdp") - pl.col("imports_pct_gdp")).alias("net_external_pct_gdp"),
         ]
     )
 
-    year_options = (
-        joined_df.select("year").unique().sort("year").get_column("year").to_list()
-    )
+    year_options = joined_df.select("year").unique().sort("year").get_column("year").to_list()
     if not year_options:
         st.info("Import-export scatterplot is unavailable because years are missing.")
         st.divider()
@@ -98,25 +96,39 @@ def _render_import_export_scatter() -> None:
     if axis_max <= axis_min:
         axis_max = axis_min + 1.0
 
-    fig = px.scatter(
-        plot_df,
-        x="imports_pct_gdp",
-        y="exports_pct_gdp",
-        color="net_external_pct_gdp",
-        color_continuous_scale="RdBu",
-        hover_name="country_name",
-        hover_data={
-            "economy": True,
-            "imports_pct_gdp": ":.2f",
-            "exports_pct_gdp": ":.2f",
-            "net_external_pct_gdp": ":.2f",
-        },
-        labels={
-            "imports_pct_gdp": "Imports (% of GDP)",
-            "exports_pct_gdp": "Exports (% of GDP)",
-            "net_external_pct_gdp": "Exports - Imports (% of GDP)",
-        },
-        title=f"Imports vs Exports (% of GDP) in {selected_year}",
+    net_values = plot_df["net_external_pct_gdp"].to_numpy()
+    net_abs_max = float(max(abs(net_values.min()), abs(net_values.max()), 1.0))
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=plot_df["imports_pct_gdp"],
+            y=plot_df["exports_pct_gdp"],
+            mode="markers",
+            name="Countries",
+            marker={
+                "color": net_values,
+                "colorscale": get_diverging_colorscale(),
+                "cmin": -net_abs_max,
+                "cmid": 0.0,
+                "cmax": net_abs_max,
+                "showscale": True,
+                "colorbar": {"title": "Exports - Imports (% of GDP)"},
+                "size": 9,
+                "opacity": 0.82,
+                "line": {"width": 0.5},
+            },
+            text=plot_df["country_name"],
+            customdata=plot_df[
+                ["economy", "imports_pct_gdp", "exports_pct_gdp", "net_external_pct_gdp"]
+            ].to_numpy(),
+            hovertemplate=(
+                "<b>%{text}</b> (%{customdata[0]})<br>"
+                "Imports: %{customdata[1]:.2f}%<br>"
+                "Exports: %{customdata[2]:.2f}%<br>"
+                "Net: %{customdata[3]:.2f}%<extra></extra>"
+            ),
+        )
     )
 
     fig.add_trace(
@@ -130,9 +142,13 @@ def _render_import_export_scatter() -> None:
         )
     )
 
-    fig.update_traces(marker={"size": 9, "opacity": 0.82, "line": {"width": 0.5}})
-    fig.update_xaxes(range=[axis_min, axis_max])
-    fig.update_yaxes(range=[axis_min, axis_max])
+    fig.update_layout(
+        title=f"Imports vs Exports (% of GDP) in {selected_year}",
+        xaxis_title="Imports (% of GDP)",
+        yaxis_title="Exports (% of GDP)",
+        xaxis_range=[axis_min, axis_max],
+        yaxis_range=[axis_min, axis_max],
+    )
     fig = apply_plotly_theme(fig)
 
     st.plotly_chart(fig, width="stretch")
@@ -152,6 +168,7 @@ TOP_N_EXPORTERS = 20
 
 
 def _render_export_composition_deep_dive() -> None:
+    """Render the export-composition breakdown chart at the bottom of the page."""
     st.divider()
     st.subheader("Export Composition — Top-20 by total exports")
     st.caption(
@@ -206,15 +223,14 @@ def _render_export_composition_deep_dive() -> None:
 
     selected_iso_codes = [
         str(c).strip().upper()
-        for c in st.session_state.get(f"{PAGE_TITLE}_countries", [])
+        for c in get_shared_selected_countries()
         if str(c).strip()
     ]
 
     top = snapshot.sort("exports_total", descending=True).head(TOP_N_EXPORTERS)
     top_set = set(top.get_column("economy").to_list())
     extra_selected = snapshot.filter(
-        pl.col("economy").is_in(selected_iso_codes)
-        & ~pl.col("economy").is_in(list(top_set))
+        pl.col("economy").is_in(selected_iso_codes) & ~pl.col("economy").is_in(list(top_set))
     )
 
     combined = pl.concat([top, extra_selected], how="vertical_relaxed").sort(

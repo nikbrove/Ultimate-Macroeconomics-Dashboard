@@ -1,39 +1,63 @@
-import streamlit as st
+"""Plotly chart builders and the :class:`GraphBox` widget used by every page.
+
+Top-level functions (:func:`build_line_plot`, :func:`build_distribution_plot`,
+:func:`build_map_plot`) are pure: they take a Polars frame and return a
+``go.Figure`` already wrapped in the project's ``"app"`` Plotly template.
+:class:`GraphBox` composes them into a Streamlit fragment that handles
+metadata, year filtering, forecast calls, log-transforms, and the optional
+LLM-generated plot descriptions.
+"""
+
+import base64
+import hashlib
+import json
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, Optional
+
 import plotly.graph_objects as go
 import plotly.io as pio
 import polars as pl
-import base64
-import hashlib
+import streamlit as st
 import yaml
-import json
-from pathlib import Path
 from plotly.colors import hex_to_rgb
-from typing import Optional, Dict, Any
-from datetime import datetime
 
-from core.assets import get_markup_template, render_markup_template
 from core.api_client import (
     forecast_timeseries,
     interpret_plot_image,
 )
-from core.token_usage import record_usage
+from core.assets import get_markup_template, render_markup_template
 from core.postgres_client import (
     get_world_bank_country_mapping,
     get_world_bank_indicator,
     get_world_bank_indicator_name,
     get_world_bank_metadata,
 )
-from core.theming import PLOTLY_TEMPLATE_NAME, get_color, get_colorway
+from core.theming import (
+    PLOTLY_TEMPLATE_NAME,
+    get_color,
+    get_colorway,
+    get_confidence_band_alpha,
+    get_sequential_colorscale,
+)
+from core.token_usage import record_usage
+from core.token_usage_store import record_persistent
 
 CONFIG_PATH = Path("config.yaml")
 
 CONFIG = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
-FORECASTER_BASE_URL = (
-    f"http://forecaster:{CONFIG.get('forecaster', {}).get('port', 8001)}"
-)
+FORECASTER_BASE_URL = f"http://forecaster:{CONFIG.get('forecaster', {}).get('port', 8001)}"
 
 
 def apply_plotly_theme(fig: go.Figure) -> go.Figure:
+    """Apply the registered ``"app"`` template and disable axis grids.
+
+    Args:
+        fig: Figure to mutate in place.
+
+    Returns:
+        The same figure (returned for chaining).
+    """
     fig.update_layout(template=PLOTLY_TEMPLATE_NAME)
     fig.for_each_xaxis(lambda axis: axis.update(showgrid=False))
     fig.for_each_yaxis(lambda axis: axis.update(showgrid=False))
@@ -41,6 +65,7 @@ def apply_plotly_theme(fig: go.Figure) -> go.Figure:
 
 
 def _apply_plotly_template(fig: go.Figure) -> go.Figure:
+    """Internal alias kept for readability inside the chart builders."""
     return apply_plotly_theme(fig)
 
 
@@ -55,20 +80,37 @@ def build_line_plot(
     forecast_upper_col: Optional[str] = None,
     hover_context: Optional[str] = None,
 ) -> go.Figure:
+    """Build a Plotly line chart for one or more time series.
+
+    Args:
+        df: Historical data. Must contain ``x_col`` and ``y_col``.
+        x_col: Name of the column holding the x-axis values (typically year).
+        y_col: Name of the column holding the y-axis values.
+        group_col: When supplied, draws one line per distinct value.
+        title: Chart title.
+        forecast_df: Optional forecast frame appended as dashed lines. When
+            both ``forecast_lower_col`` and ``forecast_upper_col`` are present,
+            a shaded confidence band is added around each forecast trace.
+        forecast_lower_col: Column name of the lower CI bound in ``forecast_df``.
+        forecast_upper_col: Column name of the upper CI bound in ``forecast_df``.
+        hover_context: Optional descriptive string injected into the unified
+            hover title — used to surface units/source.
+
+    Returns:
+        Themed ``go.Figure`` ready to pass to ``st.plotly_chart``.
+    """
     fig = go.Figure()
 
     def _rgba(color: str, alpha: float) -> str:
+        """Convert a ``#rrggbb`` hex colour into ``rgba(...)`` with given alpha."""
         if color.startswith("#"):
             red, green, blue = hex_to_rgb(color)
             return f"rgba({red}, {green}, {blue}, {alpha})"
         return color
 
     def _prepare_line_df(local_df: pl.DataFrame) -> pl.DataFrame:
-        if (
-            local_df.is_empty()
-            or x_col not in local_df.columns
-            or y_col not in local_df.columns
-        ):
+        """Drop rows missing x/y, deduplicate per x (keep last), and sort by x."""
+        if local_df.is_empty() or x_col not in local_df.columns or y_col not in local_df.columns:
             return pl.DataFrame()
         return (
             local_df.filter(pl.col(x_col).is_not_null() & pl.col(y_col).is_not_null())
@@ -78,6 +120,7 @@ def build_line_plot(
         )
 
     def _build_hovertemplate(include_ci: bool = False) -> str:
+        """Resolve the right hover template (single vs. grouped, with/without CI)."""
         value_label = "Forecast" if include_ci else "Value"
         ci_suffix = get_markup_template("line_plot_ci_suffix") if include_ci else ""
         if group_col:
@@ -95,6 +138,7 @@ def build_line_plot(
         )
 
     def _build_unified_hover_title() -> Optional[str]:
+        """Render the unified-hover title only when context (units/source) is set."""
         if hover_context:
             return render_markup_template(
                 "line_plot_unified_hover_title",
@@ -105,25 +149,14 @@ def build_line_plot(
     series_names: list[str] = []
     if group_col and group_col in df.columns:
         series_names.extend(
-            [
-                str(val)
-                for val in df[group_col]
-                .drop_nulls()
-                .unique(maintain_order=True)
-                .to_list()
-            ]
+            [str(val) for val in df[group_col].drop_nulls().unique(maintain_order=True).to_list()]
         )
     elif not df.is_empty():
         series_names.append("Historical")
 
     if forecast_df is not None and not forecast_df.is_empty():
         if group_col and group_col in forecast_df.columns:
-            for value in (
-                forecast_df[group_col]
-                .drop_nulls()
-                .unique(maintain_order=True)
-                .to_list()
-            ):
+            for value in forecast_df[group_col].drop_nulls().unique(maintain_order=True).to_list():
                 series_name = str(value)
                 if series_name not in series_names:
                     series_names.append(series_name)
@@ -131,9 +164,7 @@ def build_line_plot(
             series_names.append("Historical")
 
     palette = get_colorway()
-    series_colors = {
-        name: palette[index % len(palette)] for index, name in enumerate(series_names)
-    }
+    series_colors = {name: palette[index % len(palette)] for index, name in enumerate(series_names)}
 
     if df.is_empty():
         fig.add_annotation(text="No historical data.", showarrow=False)
@@ -176,9 +207,7 @@ def build_line_plot(
 
     if forecast_df is not None and not forecast_df.is_empty():
         if group_col and group_col in forecast_df.columns:
-            for (group_val,), f_df in forecast_df.partition_by(
-                group_col, as_dict=True
-            ).items():
+            for (group_val,), f_df in forecast_df.partition_by(group_col, as_dict=True).items():
                 prepared_forecast_df = _prepare_line_df(f_df)
                 if prepared_forecast_df.is_empty():
                     continue
@@ -209,9 +238,10 @@ def build_line_plot(
                             mode="lines",
                             line=dict(color=trace_color, width=0),
                             fill="tonexty",
-                            fillcolor=_rgba(trace_color, 0.18)
-                            if trace_color
-                            else "rgba(99, 110, 250, 0.18)",
+                            fillcolor=_rgba(
+                                trace_color or get_colorway()[0],
+                                get_confidence_band_alpha(),
+                            ),
                             legendgroup=series_name,
                             showlegend=False,
                             hoverinfo="skip",
@@ -290,9 +320,7 @@ def build_line_plot(
                 )
             )
 
-    fig.update_layout(
-        title=title, hovermode="x unified", margin=dict(l=20, r=20, t=40, b=20)
-    )
+    fig.update_layout(title=title, hovermode="x unified", margin=dict(l=20, r=20, t=40, b=20))
     unified_hover_title = _build_unified_hover_title()
     if unified_hover_title:
         fig.update_xaxes(unifiedhovertitle_text=unified_hover_title)
@@ -308,6 +336,23 @@ def build_distribution_plot(
     orientation: str = "vertical",
     reference_lines: Optional[list[dict[str, Any]]] = None,
 ) -> go.Figure:
+    """Build a distribution chart (histogram / density / violin / box).
+
+    Args:
+        df: Input data.
+        val_col: Numeric column to summarise.
+        group_col: When supplied, draws one overlaid trace per group.
+        title: Chart title.
+        plot_type: One of ``"histplot"``, ``"normalized_histplot"``,
+            ``"violinplot"``, or ``"boxplot"``.
+        orientation: ``"vertical"`` (default) or ``"horizontal"``.
+        reference_lines: Optional list of ``{"label", "value"}`` dicts drawn
+            as dashed reference lines (used to highlight selected countries
+            against the global distribution).
+
+    Returns:
+        Themed ``go.Figure`` ready to render.
+    """
     fig = go.Figure()
     is_normalized_hist = plot_type == "normalized_histplot"
     is_histplot = plot_type in {"histplot", "normalized_histplot"}
@@ -324,6 +369,7 @@ def build_distribution_plot(
         nbins: int,
         opacity: Optional[float] = None,
     ) -> None:
+        """Append one trace whose kind matches the outer ``plot_type`` switch."""
         values = local_df[val_col]
 
         if plot_type == "violinplot":
@@ -341,7 +387,7 @@ def build_distribution_plot(
             return
 
         if plot_type == "boxplot":
-            trace_kwargs = {
+            trace_kwargs: Dict[str, Any] = {
                 "name": trace_name,
                 "orientation": "v" if is_vertical else "h",
             }
@@ -401,8 +447,11 @@ def build_distribution_plot(
     if reference_lines:
         line_palette = get_colorway()
         for idx, line_info in enumerate(reference_lines):
+            raw_value = line_info.get("value")
+            if raw_value is None:
+                continue
             try:
-                level = float(line_info.get("value"))
+                level = float(raw_value)
             except (TypeError, ValueError):
                 continue
             label = str(line_info.get("label") or f"Series {idx + 1}")
@@ -440,6 +489,20 @@ def build_map_plot(
     hover_context: Optional[str] = None,
     value_label: str = "Value",
 ) -> go.Figure:
+    """Build a choropleth world map keyed by ISO-3 country codes.
+
+    Args:
+        df: Source frame.
+        iso_col: Column holding ISO-3 codes (upper-cased internally).
+        val_col: Column holding the metric to colour by.
+        title: Chart title.
+        text_col: Optional column used for the hover label (defaults to ISO code).
+        hover_context: Optional descriptive string injected into the hover.
+        value_label: Legend / hover label for the value scale.
+
+    Returns:
+        Themed ``go.Figure`` ready to render.
+    """
     fig = go.Figure()
 
     if df.is_empty():
@@ -449,9 +512,7 @@ def build_map_plot(
 
     locations = [str(code).upper() for code in df[iso_col].to_list()]
     z_values = df[val_col].to_list()
-    hover_text = (
-        df[text_col].to_list() if text_col and text_col in df.columns else locations
-    )
+    hover_text = df[text_col].to_list() if text_col and text_col in df.columns else locations
     hovertemplate = render_markup_template(
         "map_hovertemplate",
         value_label=value_label,
@@ -471,6 +532,7 @@ def build_map_plot(
             hovertemplate=hovertemplate,
             locationmode="ISO-3",
             autocolorscale=False,
+            colorscale=get_sequential_colorscale(),
             colorbar_title=value_label,
         )
     )
@@ -497,6 +559,22 @@ class GraphBox:
         item_config: Dict[str, Any],
         selected_countries: Optional[list[str]] = None,
     ):
+        """Stateful renderer for a World Bank indicator card.
+
+        Composes the left-side world map and the right-side
+        (time-trend or distribution) chart, with optional log-transform,
+        on-demand forecasting, year filter, metadata expander, and the
+        two LLM-driven plot description toggles. Each instance is bound
+        to a single indicator id; pages instantiate one per chart.
+
+        Args:
+            item_config: Indicator descriptor with at least ``id`` and
+                ``name`` keys (typically loaded from the page's chart
+                config block).
+            selected_countries: ISO codes selected globally on the page;
+                used as forecast inputs and as reference lines on the
+                distribution plot.
+        """
         self.config = item_config
         self.item_id = self.config["id"]
         self.name = self.config["name"]
@@ -511,6 +589,7 @@ class GraphBox:
         self.key_prefix = f"world_bank_{self.item_id}"
 
     def _get_schema_mapping(self) -> Dict[str, str]:
+        """Return the canonical ``{role: column_name}`` mapping used by the helpers."""
         return {
             "x": "year",
             "y": "value",
@@ -518,9 +597,11 @@ class GraphBox:
         }
 
     def _fetch_data(self) -> pl.DataFrame:
+        """Pull every year/economy row for this indicator from Postgres."""
         return get_world_bank_indicator(self.item_id, country_code="ALL")
 
     def _prepare_time_trend_df(self, historical_df: pl.DataFrame) -> pl.DataFrame:
+        """Return the time-trend slice: rows with non-null y, optionally filtered to selected countries, sorted."""
         schema = self._get_schema_mapping()
         if historical_df.is_empty() or schema["y"] not in historical_df.columns:
             return pl.DataFrame()
@@ -529,10 +610,7 @@ class GraphBox:
         if self.selected_countries:
             normalized = [str(c).upper() for c in self.selected_countries]
             cleaned = cleaned.filter(
-                pl.col(schema["group"])
-                .cast(pl.Utf8)
-                .str.to_uppercase()
-                .is_in(normalized)
+                pl.col(schema["group"]).cast(pl.Utf8).str.to_uppercase().is_in(normalized)
             )
 
         return cleaned.sort([schema["x"], schema["group"]])
@@ -541,6 +619,15 @@ class GraphBox:
         self,
         historical_df: pl.DataFrame,
     ) -> tuple[list[str], list[float]]:
+        """Convert a per-country historical slice into ``(dates, values)`` lists.
+
+        Args:
+            historical_df: Sub-frame for one country (already filtered).
+
+        Returns:
+            Tuple of ISO date strings and floats, suitable for the
+            forecaster's JSON payload.
+        """
         schema = self._get_schema_mapping()
         if historical_df.is_empty() or schema["x"] not in historical_df.columns:
             return [], []
@@ -562,14 +649,22 @@ class GraphBox:
         points: list[dict[str, Any]],
         group_value: str,
     ) -> pl.DataFrame:
+        """Reshape the forecaster's ``ds/yhat/...`` payload into the page's schema.
+
+        Args:
+            points: Raw rows from the forecast service.
+            group_value: Country code (or ``"Forecast"`` when ungrouped) to
+                stamp into the group column so the trace gets the right colour.
+
+        Returns:
+            Polars frame with columns ``year`` / ``value`` /
+            ``value_lower`` / ``value_upper`` / ``economy``.
+        """
         schema = self._get_schema_mapping()
         forecast_df = pl.DataFrame(points)
 
         return forecast_df.with_columns(
-            pl.col("ds")
-            .str.strptime(pl.Datetime, strict=False)
-            .dt.year()
-            .alias(schema["x"]),
+            pl.col("ds").str.strptime(pl.Datetime, strict=False).dt.year().alias(schema["x"]),
             pl.col("yhat").alias(schema["y"]),
             pl.col("yhat_lower").alias(f"{schema['y']}_lower"),
             pl.col("yhat_upper").alias(f"{schema['y']}_upper"),
@@ -592,6 +687,20 @@ class GraphBox:
         alpha: float,
         model_type: str,
     ) -> pl.DataFrame:
+        """Call the forecaster service for each country in scope, concatenated.
+
+        Args:
+            historical_df: Time-trend frame (one row per year × economy).
+            lookback: Number of historical points the model is allowed to use.
+            steps: Forecast horizon.
+            alpha: Confidence-interval alpha (e.g. 0.05 -> 95% CI).
+            model_type: ``"prophet"`` / ``"arima"`` / ``"chronos"``.
+
+        Returns:
+            Concatenated forecast frame across countries, or an empty
+            frame when the inputs are too short or the service errors.
+            Side-effect: writes Streamlit warnings/info messages.
+        """
         schema = self._get_schema_mapping()
         if historical_df.is_empty():
             return pl.DataFrame()
@@ -639,9 +748,7 @@ class GraphBox:
 
                 points = response.get("forecast", [])
                 if points:
-                    series_frames.append(
-                        self._format_forecast_response(points, str(group_value))
-                    )
+                    series_frames.append(self._format_forecast_response(points, str(group_value)))
         else:
             dates, values = self._build_forecast_input(historical_df)
             if len(values) < 6:
@@ -678,12 +785,14 @@ class GraphBox:
         return pl.concat(series_frames, how="vertical_relaxed")
 
     def _get_metadata(self) -> dict[str, Any]:
+        """Return the first metadata row for this indicator (or empty dict)."""
         meta_df = get_world_bank_metadata(self.item_id)
         if meta_df.is_empty():
             return {}
         return meta_df.to_dicts()[0]
 
     def _build_hover_context(self, metadata: dict[str, Any]) -> str:
+        """Build the indicator-name (and units, when present) hover banner."""
         indicator_name = self.name
         units = str(metadata.get("units") or "").strip()
         if units:
@@ -702,6 +811,16 @@ class GraphBox:
         df: pl.DataFrame,
         value_columns: list[str],
     ) -> tuple[pl.DataFrame, int]:
+        """Replace each value column with its natural log; drop non-positive rows.
+
+        Args:
+            df: Input frame.
+            value_columns: Columns to log-transform; missing columns are ignored.
+
+        Returns:
+            Tuple of ``(transformed_df, dropped_row_count)``. ``dropped_row_count``
+            is surfaced to the user as a caption.
+        """
         valid_columns = [col for col in value_columns if col in df.columns]
         if df.is_empty() or not valid_columns:
             return df, 0
@@ -721,6 +840,7 @@ class GraphBox:
         return transformed_df, dropped_rows
 
     def _render_metadata_markdown(self, metadata: dict[str, Any]) -> None:
+        """Stream the indicator metadata into the page as titled markdown sections."""
         if not metadata:
             st.info("No metadata found for this identifier.")
             return
@@ -735,6 +855,7 @@ class GraphBox:
         ]
 
         def _format_label(field: str) -> str:
+            """Humanise a metadata key for display (special-case the WB camel-case one)."""
             if field == "Statisticalconceptandmethodology":
                 return "Statistical concept and methodology"
             return field.replace("_", " ").strip().title()
@@ -763,6 +884,7 @@ class GraphBox:
             st.markdown("")
 
     def _right_plot_signature(self, figure: go.Figure) -> str:
+        """Hash the figure's JSON so plot-description caching survives reruns."""
         try:
             raw_json = figure.to_plotly_json()
             serialized = json.dumps(raw_json, sort_keys=True, default=str)
@@ -776,6 +898,21 @@ class GraphBox:
         mode: str,
         chart_context: str,
     ) -> str:
+        """Render the figure to PNG and ask the agent's vision endpoint to describe it.
+
+        Results are cached per ``(mode, figure_hash)`` in ``st.session_state``
+        so toggling the description checkbox on/off does not re-call the LLM.
+
+        Args:
+            figure: The figure to describe (right-side chart).
+            mode: ``"no_hallucinations"`` for a strict factual reading or
+                ``"creative"`` for an interpretive narrative.
+            chart_context: Free-text context appended to the prompt
+                (indicator name, year, chart type).
+
+        Returns:
+            The model's description (or a placeholder string when empty).
+        """
         fig_signature = self._right_plot_signature(figure)
         cache_key = f"{self.key_prefix}_plot_description_cache"
         mode_cache_key = f"{mode}:{fig_signature}"
@@ -791,7 +928,9 @@ class GraphBox:
             mode=mode,
             chart_context=chart_context,
         )
-        record_usage(response.get("usage"))
+        usage_payload = response.get("usage")
+        record_usage(usage_payload)
+        record_persistent("plot_interpret", usage_payload)
         description = str(response.get("description", "")).strip()
         if not description:
             description = "No interpretation returned."
@@ -899,6 +1038,7 @@ class GraphBox:
         dropped_distribution_points: int,
         dropped_reference_points: int,
     ) -> None:
+        """Emit a single caption summarising every row dropped by the log transform."""
         notes: list[str] = []
         if dropped_map_points:
             notes.append(f"map: {dropped_map_points}")
@@ -914,14 +1054,17 @@ class GraphBox:
                 notes.append(f"distribution reference lines: {dropped_reference_points}")
 
         if notes:
-            st.caption(
-                "ln transform skipped non-positive values in "
-                + ", ".join(notes)
-                + "."
-            )
+            st.caption("ln transform skipped non-positive values in " + ", ".join(notes) + ".")
 
     @st.fragment
     def render_streamlit_ui(self):
+        """Render the full indicator card and re-execute as a Streamlit fragment.
+
+        This is the only public entry-point. Pages call it inside a column
+        layout; everything (fetching, forecasting, log-transform, plotting,
+        plot description, metadata expander) happens inside one fragment
+        so toggling a control re-renders this card only.
+        """
         schema = self._get_schema_mapping()
         use_log_key = f"{self.key_prefix}_use_log_transform"
         use_log = bool(st.session_state.get(use_log_key, False))
@@ -976,9 +1119,7 @@ class GraphBox:
                     selected_year = max_year
                     st.session_state[year_key] = selected_year
 
-                df_year = with_year.filter(pl.col("__year") == selected_year).drop(
-                    "__year"
-                )
+                df_year = with_year.filter(pl.col("__year") == selected_year).drop("__year")
             else:
                 selected_year = datetime.now().year - 1
                 min_year = selected_year
@@ -1027,20 +1168,18 @@ class GraphBox:
             dropped_time_trend_points = 0
             dropped_forecast_points = 0
             if use_log:
-                plotted_time_trend_df, dropped_time_trend_points = (
-                    self._apply_log_to_columns(df_time_trend, [schema["y"]])
+                plotted_time_trend_df, dropped_time_trend_points = self._apply_log_to_columns(
+                    df_time_trend, [schema["y"]]
                 )
 
                 if df_forecast is not None and not df_forecast.is_empty():
-                    plotted_forecast_df, dropped_forecast_points = (
-                        self._apply_log_to_columns(
-                            df_forecast,
-                            [
-                                schema["y"],
-                                f"{schema['y']}_lower",
-                                f"{schema['y']}_upper",
-                            ],
-                        )
+                    plotted_forecast_df, dropped_forecast_points = self._apply_log_to_columns(
+                        df_forecast,
+                        [
+                            schema["y"],
+                            f"{schema['y']}_lower",
+                            f"{schema['y']}_upper",
+                        ],
                     )
 
             map_title = "Map"
@@ -1051,11 +1190,7 @@ class GraphBox:
             country_lookup = get_world_bank_country_mapping()
             map_df = (
                 df_year.filter(
-                    pl.col(schema["group"])
-                    .cast(pl.Utf8)
-                    .str.to_uppercase()
-                    .str.len_chars()
-                    == 3
+                    pl.col(schema["group"]).cast(pl.Utf8).str.to_uppercase().str.len_chars() == 3
                 )
                 .group_by(schema["group"])
                 .agg(pl.col(schema["y"]).last().alias(schema["y"]))
@@ -1064,20 +1199,16 @@ class GraphBox:
                 set(country_lookup.columns)
             ):
                 map_df = map_df.join(
-                    country_lookup.rename(
-                        {"id": schema["group"], "value": "country_name"}
-                    ),
+                    country_lookup.rename({"id": schema["group"], "value": "country_name"}),
                     on=schema["group"],
                     how="left",
                 ).with_columns(
-                    pl.coalesce(
-                        [pl.col("country_name"), pl.col(schema["group"])]
-                    ).alias("country_name")
+                    pl.coalesce([pl.col("country_name"), pl.col(schema["group"])]).alias(
+                        "country_name"
+                    )
                 )
             if use_log:
-                map_df, dropped_map_points = self._apply_log_to_columns(
-                    map_df, [schema["y"]]
-                )
+                map_df, dropped_map_points = self._apply_log_to_columns(map_df, [schema["y"]])
                 map_title = "Map (ln)"
                 map_value_label = "ln(Value)"
 
@@ -1109,8 +1240,8 @@ class GraphBox:
             else:
                 distribution_df = df_year
                 if use_log:
-                    distribution_df, dropped_distribution_points = (
-                        self._apply_log_to_columns(df_year, [schema["y"]])
+                    distribution_df, dropped_distribution_points = self._apply_log_to_columns(
+                        df_year, [schema["y"]]
                     )
 
                 distribution_reference_lines = None
@@ -1147,9 +1278,7 @@ class GraphBox:
                         if not selected_levels_df.is_empty():
                             if use_log:
                                 selected_levels_df, dropped_reference_points = (
-                                    self._apply_log_to_columns(
-                                        selected_levels_df, [schema["y"]]
-                                    )
+                                    self._apply_log_to_columns(selected_levels_df, [schema["y"]])
                                 )
 
                             selected_levels_df = selected_levels_df.with_columns(

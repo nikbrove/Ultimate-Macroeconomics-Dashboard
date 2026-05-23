@@ -4,6 +4,39 @@ All notable changes to **Ultimate Macroeconomics Dashboard** are documented in t
 
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v0.9]
+
+AI-analyst quality and latency pass plus a critical fix to the read-only LLM Postgres role's permissions, on top of a broader maintenance pass: new `tests/` suites under every service (`agent`, `app`, `clustering`, `downloader_extra`, `downloader_general`, `forecaster`, `python_sandbox`), two new app pages (`17_token_usage`, `18_monitoring`) replacing the legacy `16_settings`, retirement of the standalone `_container_data/db_init.sh` (its job is now done by `downloader_general`'s bootstrap), and assorted refactors across every service. Same architecture, same overall UI; the multi-agent graph is shorter (one fewer LLM call per turn) and the supervisor / SQL / chat / RAG / web-search workers are now grounded in chat history, a centralised macro context block, and a deterministic worker-status channel.
+
+The notes below detail the AI-analyst + DB-permission work — the broader file-by-file diffs across the rest of the stack are visible in `git log` for the v0.9 commit.
+
+### Fixed
+- **`downloader_general`: read-only LLM role had no table privileges.** `ensure_llm_role` only created/altered the role but never granted any `SELECT`, so the AI analyst's `sql_agent` failed with `permission denied for table databases / database_indicators / indicators / …` on every query. The bootstrap now also issues `GRANT USAGE ON SCHEMA public`, `GRANT SELECT ON ALL TABLES IN SCHEMA public`, and `ALTER DEFAULT PRIVILEGES … GRANT SELECT ON TABLES` (run as the superuser so future tables created by `downloader_general` / `downloader_extra` are readable automatically). The new test `test_ensure_llm_role_grants_select_on_existing_and_future_tables` pins the contract.
+- **`downloader_general` entrypoint never re-ran the bootstrap on upgrade.** The shell entrypoint exited early on the `.download_completed` marker, so any change to `ensure_llm_role` (such as the grant fix above) would never take effect on an existing volume. The marker check now lives inside `main.py`: bootstrap runs every container start, downloads still run only once.
+
+### Added — agent quality
+- **Pass chat history to workers.** `SQLAgent`, `RAGAgent`, `WebSearchAgent`, and `ChatAgent` now receive the last 3 user/assistant turns from `AgentState.messages` in their prompts so follow-ups like "now Germany too" don't require the supervisor to re-state context. Plot / table workers don't get it — they operate on the already-fetched artifact.
+- **Worked SQL examples (few-shot).** The `SQLAgent` preamble carries 3 canonical examples (single-country WDI lookup, ticker-known Yahoo fetch, multi-country WDI with `IN (...)`) so first-shot SQL quality improves on smaller models.
+- **`last_worker_status` channel.** New `AgentState` field carrying a `Literal["SUCCESS","EMPTY","ERROR","NEEDS_DOWNLOAD","BLOCKED","UNKNOWN"]` tag returned by every worker. The supervisor's branching is now driven by this enum instead of regex-matching `"SQL_AGENT INDICATOR_NOT_DOWNLOADED:"` prose, and the prompt explicitly references the tag (e.g. "route to `downloader_agent` when `last_worker_status` is `NEEDS_DOWNLOAD`").
+- **Centralised macro context.** The supervisor preamble now states the always-on assumptions (WDI is `db_id = 2`; `indicators.economy` holds ISO-3 codes; Yahoo is the only stock/index source; today's date) instead of expecting the planner to re-derive them.
+- **Short-circuit WDI lookup in `sql_agent`.** The SQL prompt now defaults `database_id = 2` (WDI) and skips the `databases`-table lookup step unless the user explicitly names another World Bank database — drops one LLM call from most macro queries.
+
+### Changed — agent speed
+- **Dropped the FINAL_SYNTHESIS LLM call.** The supervisor already writes the final markdown answer to `isolated_worker_task` when it picks `FINISH`; `MacroAgentGraph._stream_final_synthesis` re-fed it through an extra streaming LLM call. Replaced with a chunked character-streamer (`_stream_supervisor_draft`) that emits the draft in ~24-char bursts directly — no model call, no risk of the synthesis pass altering numbers. A small leak filter (`_sanitize_draft`) strips any line containing worker names / sandbox / traceback tokens as a last-mile guard.
+- **Heuristic-first guardrail.** The previous unconditional LLM screening step is gone; `GuardrailAgent` now uses three regexes (auto-allow for short greetings + in-scope keywords, auto-block for obvious red flags) and only escalates ambiguous messages to the structured-output LLM. Same safety profile, no LLM call for the typical user message.
+- **Shared `httpx.AsyncClient`.** `execute_code_in_sandbox` and `download_indicator` used to spin up `async with httpx.AsyncClient()` per call (full TLS handshake every time). One pool is now built lazily in `agent.tools._get_httpx_client()` and closed via a FastAPI `shutdown` hook.
+- **Cached `get_database_schema_text()`.** The YAML-to-text rendering used to run on every SQL step; it's now wrapped in `functools.lru_cache(maxsize=1)` (and invalidated by `configure_runtime` for tests).
+- **Prefix-cacheable prompt layout.** Supervisor / SQL / Plotly / Polars / RAG / web-search / chat prompts have been restructured so the static role + scope + rules + (where applicable) database schema and few-shot examples form the prompt prefix, and only the per-call dynamic data lives in the trailing suffix. Providers that auto-cache identical prefixes (OpenAI, Anthropic) can now reuse them across turns.
+- **Trimmed supervisor `worker_results`.** `worker_results` uses `operator.add` and grew unboundedly across turns; the supervisor prompt now keeps the last two verbatim and summarises older entries to a single line each.
+- **Healthcheck noise reduced.** Compose healthchecks for the HTTP services (`agent` / `app` / `forecaster` / `clustering` / `downloader_extra` / `python_sandbox` / `vector_db`) bumped from `interval: 10s` to `30s` so `/health` polling no longer drowns real errors in `docker compose logs`. `db` stays at 5s (it gates `depends_on: condition: service_healthy` on stack startup).
+
+### Removed
+- **`MacroAgentGraph._stream_final_synthesis`** and its `FINAL_SYNTHESIS_SYSTEM_PROMPT` — replaced by direct chunked emission of the supervisor's draft.
+
+### Operator notes
+- **Existing deployments** need a one-time rebuild of `downloader_general` so the new bootstrap runs against their already-populated DB: `docker compose build downloader_general && docker compose up -d downloader_general`. The container will re-apply role + grants in seconds, find the download marker, and exit without re-running the multi-hour ingestion.
+- **No `.env` / `config.yaml` changes** required.
+
 ## [v0.8]
 
 Codebase-wide refactoring pass across all ten containers. No new user-facing features — the goals were dedup, dead-code removal, async-safety, error-handling hardening, and modular structure. Same architecture, same UI, cleaner internals.

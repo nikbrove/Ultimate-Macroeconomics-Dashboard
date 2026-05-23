@@ -1,16 +1,23 @@
+"""Economy-structure page — agriculture / manufacturing / services shares of GDP.
+
+In addition to the standard indicator cards, this page renders two custom
+sections: a donut showing the sector mix for one selected country in the
+latest year where all three sectors are reported, and a stacked-area
+small-multiples view of how each country's mix has shifted over time.
+"""
+
 import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
 
 from core.page_helpers import fetch_indicator_slice
 from core.plotting import apply_plotly_theme
-from core.theming import get_color
 from core.postgres_client import (
     get_world_bank_country_codes,
     get_world_bank_country_mapping,
 )
-from pages.page_utils import render_page_from_config
-
+from core.theming import get_color
+from pages.page_utils import get_shared_selected_countries, render_page_from_config
 
 ECONOMY_STRUCTURE_INDICATORS = [
     ("Agriculture", "NV.AGR.TOTL.ZS", "sector_agriculture"),
@@ -21,6 +28,7 @@ PAGE_TITLE = "Economy Structure"
 
 
 def _build_country_labels() -> tuple[list[str], dict[str, str], dict[str, str]]:
+    """Return ``(sorted ISO codes, label_by_iso, name_by_iso)`` for selectboxes."""
     country_options = sorted(get_world_bank_country_codes())
     country_mapping_df = get_world_bank_country_mapping()
     label_by_iso: dict[str, str] = {}
@@ -38,10 +46,11 @@ def _build_country_labels() -> tuple[list[str], dict[str, str], dict[str, str]]:
 
 
 def _resolve_default_structure_country(country_options: list[str]) -> str | None:
+    """Pick a sensible default: first selected trend country, else USA, else first option."""
     if not country_options:
         return None
 
-    selected_trend_countries = st.session_state.get(f"{PAGE_TITLE}_countries", [])
+    selected_trend_countries = get_shared_selected_countries()
     if selected_trend_countries:
         first_selected = str(selected_trend_countries[0]).strip().upper()
         if first_selected in country_options:
@@ -56,6 +65,12 @@ def _resolve_default_structure_country(country_options: list[str]) -> str | None
 def _build_economy_structure_data(
     country_code: str,
 ) -> tuple[pl.DataFrame, int | None]:
+    """Compute the latest year where all three sectors are reported and the row values.
+
+    Returns:
+        ``(structure_df, latest_year)`` — empty frame and ``None`` when no
+        common year exists for the country.
+    """
     latest_common_year_df: pl.DataFrame | None = None
 
     for sector_name, indicator_id, _ in ECONOMY_STRUCTURE_INDICATORS:
@@ -90,8 +105,7 @@ def _build_economy_structure_data(
             "indicator_id": [item[1] for item in ECONOMY_STRUCTURE_INDICATORS],
             "color": [get_color(item[2]) for item in ECONOMY_STRUCTURE_INDICATORS],
             "value": [
-                float(latest_row.get_column(item[0])[0])
-                for item in ECONOMY_STRUCTURE_INDICATORS
+                float(latest_row.get_column(item[0])[0]) for item in ECONOMY_STRUCTURE_INDICATORS
             ],
         }
     ).filter(pl.col("value").is_not_null() & (pl.col("value") >= 0))
@@ -104,6 +118,7 @@ def _build_economy_structure_pie(
     country_name: str,
     year: int,
 ) -> go.Figure:
+    """Build the donut chart that summarises the sector split for one country/year."""
     fig = go.Figure(
         data=[
             go.Pie(
@@ -116,8 +131,7 @@ def _build_economy_structure_pie(
                 textinfo="text",
                 customdata=structure_df["indicator_id"].to_list(),
                 hovertemplate=(
-                    "%{label}<br>%{value:.2f}% of GDP"
-                    "<br>Indicator: %{customdata}<extra></extra>"
+                    "%{label}<br>%{value:.2f}% of GDP<br>Indicator: %{customdata}<extra></extra>"
                 ),
             )
         ]
@@ -130,6 +144,7 @@ def _build_economy_structure_pie(
 
 
 def _render_economy_structure_section() -> None:
+    """Render the country selector + sector donut block at the top of the page."""
     st.subheader("Economy Structure")
 
     country_options, label_by_iso, name_by_iso = _build_country_labels()
@@ -175,6 +190,14 @@ def _render_economy_structure_section() -> None:
 
 
 def _build_sector_timeseries(country_code: str | None) -> tuple[pl.DataFrame, str | None]:
+    """Inner-join the three sector series into one ``year`` × sectors panel.
+
+    Args:
+        country_code: ISO code, or ``None`` to use the global cross-country mean.
+
+    Returns:
+        ``(panel_df, country_code)`` — panel is empty when any sector is missing.
+    """
     rows: list[pl.DataFrame] = []
     for sector_name, indicator_id, _ in ECONOMY_STRUCTURE_INDICATORS:
         if country_code is None:
@@ -204,9 +227,8 @@ def _build_sector_timeseries(country_code: str | None) -> tuple[pl.DataFrame, st
     return panel, country_code
 
 
-def _build_sector_area(
-    panel: pl.DataFrame, title: str
-) -> go.Figure:
+def _build_sector_area(panel: pl.DataFrame, title: str) -> go.Figure:
+    """Build the stacked-area chart for the panel returned by ``_build_sector_timeseries``."""
     fig = go.Figure()
     for sector_name, _, color_token in ECONOMY_STRUCTURE_INDICATORS:
         if sector_name not in panel.columns:
@@ -232,6 +254,7 @@ def _build_sector_area(
 
 
 def _render_sector_trajectory_deep_dive() -> None:
+    """Render the small-multiples sector trajectory block at the bottom of the page."""
     st.divider()
     st.subheader("Sector Trajectory (1960 → today)")
     st.caption(
@@ -243,7 +266,7 @@ def _render_sector_trajectory_deep_dive() -> None:
 
     selected_codes = [
         str(code).strip().upper()
-        for code in st.session_state.get(f"{PAGE_TITLE}_countries", [])
+        for code in get_shared_selected_countries()
         if str(code).strip()
     ][:4]
     _, label_by_iso, name_by_iso = _build_country_labels()

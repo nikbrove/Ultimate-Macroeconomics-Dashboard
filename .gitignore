@@ -1,31 +1,104 @@
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
 __pycache__/
-.cache/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.Python
+build/
+dist/
+wheels/
+pip-wheel-metadata/
+.eggs/
+
+# Virtual environments
 venv/
 venv*/
 .venv/
 .venv*/
-test/
-test*/
+env/
+ENV/
 
+# Jupyter / notebooks
 .ipynb_checkpoints/
 *.ipynb_backup
 
-.env
+# Tooling caches
+.cache/
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.pyre/
+.pytype/
+.ty_cache/
+.tox/
+.nox/
 
+# Coverage
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.hypothesis/
+
+# ---------------------------------------------------------------------------
+# Tests (negation — keep tests/ dirs but ignore generic test*/ scratch dirs)
+# ---------------------------------------------------------------------------
+test/
+test*/
+!tests/
+!**/tests/
+
+# ---------------------------------------------------------------------------
+# Project runtime / secrets
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# Ingested data + ingestion marker (re-created on first boot)
+/_container_data/downloader_general/news
+/_container_data/downloader_general/.download_completed
+
+# Logs
 logs/
 *.log
 *.log.*
 
+# SQL dumps
 *.sql
 
-*.pyc
-
+# ---------------------------------------------------------------------------
+# IDEs / editors
+# ---------------------------------------------------------------------------
+.vscode/
 *.vscode
-/_container_data/downloader_general/news
-/_container_data/downloader_general/.download_completed
+.idea/
+*.swp
+*.swo
+*~
 
+# Local Claude Code state
 .claude/
 
+# ---------------------------------------------------------------------------
+# OS
+# ---------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ---------------------------------------------------------------------------
+# LaTeX build artefacts
+# ---------------------------------------------------------------------------
 *.aux
 *.fls
 *.out
@@ -33,4 +106,9 @@ logs/
 *.gz
 *.fdb_latexmk
 
+# ---------------------------------------------------------------------------
+# Misc / backup files
+# ---------------------------------------------------------------------------
 *.bkp
+*.bak
+*.tmp

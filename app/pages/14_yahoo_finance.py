@@ -1,3 +1,10 @@
+"""Yahoo Finance dashboard — index overview + per-ticker drill-down.
+
+Renders a market overview (an index + the FAANG group), a candlestick
+chart, a sector treemap, and a correlation heatmap. Driven entirely
+from the cached Polars frames loaded by ``core.postgres_client``.
+"""
+
 from datetime import datetime
 from typing import Optional
 
@@ -5,12 +12,11 @@ import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
 
-from core.assets import get_markup_template
 from core.app_logging import log_page_render
+from core.assets import get_markup_template
 from core.plotting import apply_plotly_theme, build_line_plot
-from core.theming import get_color, get_diverging_colorscale
 from core.postgres_client import get_all_yahoo_historical_prices, get_all_yahoo_metadata
-
+from core.theming import get_color, get_diverging_colorscale
 
 YAHOO_KEY_PREFIX = "yahoo_finance_yahoo_market_overview"
 DEFAULT_COMPANY_TICKERS = ["META", "AAPL", "AMZN", "GOOGL", "MSFT"]
@@ -39,13 +45,12 @@ def build_yahoo_candlestick_plot(
     close_col: str,
     title: str = "",
 ) -> go.Figure:
+    """Build a themed candlestick chart for one ticker's OHLC history."""
     fig = go.Figure()
     required_cols = [date_col, open_col, high_col, low_col, close_col]
 
     if df.is_empty() or any(col not in df.columns for col in required_cols):
-        fig.add_annotation(
-            text="No OHLC data available for candlestick chart.", showarrow=False
-        )
+        fig.add_annotation(text="No OHLC data available for candlestick chart.", showarrow=False)
         fig.update_layout(title=title)
         return apply_plotly_theme(fig)
 
@@ -57,9 +62,7 @@ def build_yahoo_candlestick_plot(
         .sort(date_col)
     )
     if prepared_df.is_empty():
-        fig.add_annotation(
-            text="No OHLC data available for candlestick chart.", showarrow=False
-        )
+        fig.add_annotation(text="No OHLC data available for candlestick chart.", showarrow=False)
         fig.update_layout(title=title)
         return apply_plotly_theme(fig)
 
@@ -93,6 +96,7 @@ def build_yahoo_treemap_plot(
     title: str = "",
     hover_col: Optional[str] = None,
 ) -> go.Figure:
+    """Build a sector / industry treemap with optional hover detail column."""
     fig = go.Figure()
 
     if df.is_empty() or values_col not in df.columns:
@@ -100,9 +104,7 @@ def build_yahoo_treemap_plot(
         fig.update_layout(title=title)
         return apply_plotly_theme(fig)
 
-    customdata = (
-        df[hover_col].to_list() if hover_col and hover_col in df.columns else None
-    )
+    customdata = df[hover_col].to_list() if hover_col and hover_col in df.columns else None
     trace = go.Treemap(
         labels=df[labels_col].to_list(),
         parents=df[parents_col].to_list(),
@@ -126,14 +128,11 @@ def build_yahoo_correlation_heatmap(
     title: str = "",
     ticker_name_map: Optional[dict[str, str]] = None,
 ) -> go.Figure:
+    """Build a Pearson-correlation heatmap of every ticker pair in ``df``."""
     fig = go.Figure()
 
-    if df.is_empty() or any(
-        col not in df.columns for col in [date_col, ticker_col, value_col]
-    ):
-        fig.add_annotation(
-            text="No data available for correlation heatmap.", showarrow=False
-        )
+    if df.is_empty() or any(col not in df.columns for col in [date_col, ticker_col, value_col]):
+        fig.add_annotation(text="No data available for correlation heatmap.", showarrow=False)
         fig.update_layout(title=title)
         return apply_plotly_theme(fig)
 
@@ -142,7 +141,7 @@ def build_yahoo_correlation_heatmap(
         .pivot(
             values=value_col,
             index=date_col,
-            columns=ticker_col,
+            on=ticker_col,
             aggregate_function="last",
         )
         .sort(date_col)
@@ -159,6 +158,7 @@ def build_yahoo_correlation_heatmap(
     customdata_rows: list[list[list[str]]] = []
 
     def _format_ticker_label(ticker: str) -> str:
+        """Pretty-print a ticker with its company name when available."""
         if not ticker_name_map:
             return ticker
         company_name = ticker_name_map.get(ticker, ticker)
@@ -212,6 +212,7 @@ def build_yahoo_correlation_heatmap(
 
 
 def _build_combined_label_map(df: pl.DataFrame) -> dict[str, str]:
+    """Map each ticker to its display label (``"AAPL - Apple Inc"`` or just the ticker)."""
     label_df = df.select(
         [
             pl.col("ticker"),
@@ -233,6 +234,7 @@ def _build_combined_label_map(df: pl.DataFrame) -> dict[str, str]:
 
 
 def _build_asset_name_map(df: pl.DataFrame) -> dict[str, str]:
+    """Map each ticker to its asset name (or the ticker itself when missing)."""
     label_df = df.select(
         [
             pl.col("ticker"),
@@ -246,6 +248,7 @@ def _default_index_selection(
     available_index_tickers: list[str],
     index_label_map: dict[str, str],
 ) -> list[str]:
+    """Pick one ticker per :data:`PREFERRED_INDEX_GROUPS` entry to seed the multiselect."""
     selected: list[str] = []
     for ticker_aliases, label_tokens in PREFERRED_INDEX_GROUPS:
         matched_ticker = None
@@ -266,6 +269,7 @@ def _default_index_selection(
 
 
 def render_yahoo_finance_dashboard() -> None:
+    """Page entry-point: market overview, candlestick, treemap, correlation grid."""
     log_page_render("Yahoo Finance Dashboard")
     st.title("Yahoo Finance Dashboard")
     st.caption(
@@ -283,9 +287,7 @@ def render_yahoo_finance_dashboard() -> None:
             return
 
         if meta_df.is_empty() or "ticker" not in meta_df.columns:
-            st.info(
-                "Yahoo metadata is missing. Unable to separate companies and indices."
-            )
+            st.info("Yahoo metadata is missing. Unable to separate companies and indices.")
             return
 
         meta_min = meta_df.select(
@@ -305,9 +307,7 @@ def render_yahoo_finance_dashboard() -> None:
         companies_all = hist_enriched.filter(
             pl.col("category").str.to_lowercase() == "companies"
         ).with_columns(pl.col("date").dt.year().alias("__year"))
-        indices_all = hist_enriched.filter(
-            pl.col("category").str.to_lowercase() == "indices"
-        )
+        indices_all = hist_enriched.filter(pl.col("category").str.to_lowercase() == "indices")
 
         if companies_all.is_empty():
             st.info("No records found for category 'Companies' in yahoo metadata.")
@@ -326,9 +326,7 @@ def render_yahoo_finance_dashboard() -> None:
 
         company_label_map = _build_combined_label_map(companies_all)
         default_company_selection = [
-            ticker
-            for ticker in DEFAULT_COMPANY_TICKERS
-            if ticker in available_company_tickers
+            ticker for ticker in DEFAULT_COMPANY_TICKERS if ticker in available_company_tickers
         ]
         if not default_company_selection:
             default_company_selection = available_company_tickers[:6]
@@ -353,9 +351,7 @@ def render_yahoo_finance_dashboard() -> None:
                     pl.when(pl.col("asset_name") == pl.col("ticker"))
                     .then(pl.col("ticker"))
                     .otherwise(
-                        pl.concat_str(
-                            [pl.col("ticker"), pl.lit(" - "), pl.col("asset_name")]
-                        )
+                        pl.concat_str([pl.col("ticker"), pl.lit(" - "), pl.col("asset_name")])
                     )
                     .alias("company_label")
                 )
@@ -397,9 +393,9 @@ def render_yahoo_finance_dashboard() -> None:
             key=f"{YAHOO_KEY_PREFIX}_company_candlestick_selection",
         )
 
-        candlestick_df = companies_all.filter(
-            pl.col("ticker") == selected_candlestick_ticker
-        ).sort("date")
+        candlestick_df = companies_all.filter(pl.col("ticker") == selected_candlestick_ticker).sort(
+            "date"
+        )
         candlestick_fig = build_yahoo_candlestick_plot(
             candlestick_df,
             date_col="date",
@@ -437,9 +433,7 @@ def render_yahoo_finance_dashboard() -> None:
             help="Applies to Companies treemap and Companies correlation heatmap only.",
         )
 
-        year_df = companies_all.filter(pl.col("__year") == int(selected_year)).drop(
-            "__year"
-        )
+        year_df = companies_all.filter(pl.col("__year") == int(selected_year)).drop("__year")
         if year_df.is_empty():
             st.info("No Companies observations in selected year.")
             return
@@ -454,9 +448,7 @@ def render_yahoo_finance_dashboard() -> None:
             .join(meta_min, on="ticker", how="left")
             .with_columns(
                 pl.col("sector").fill_null("Unknown").alias("sector"),
-                pl.coalesce([pl.col("asset_name"), pl.col("ticker")]).alias(
-                    "asset_name"
-                ),
+                pl.coalesce([pl.col("asset_name"), pl.col("ticker")]).alias("asset_name"),
             )
         )
 
@@ -583,9 +575,7 @@ def render_yahoo_finance_dashboard() -> None:
                 .group_by(["date", "ticker", "asset_name"])
                 .agg(pl.col("close").last().alias("close"))
                 .with_columns(
-                    pl.coalesce([pl.col("asset_name"), pl.col("ticker")]).alias(
-                        "index_label"
-                    )
+                    pl.coalesce([pl.col("asset_name"), pl.col("ticker")]).alias("index_label")
                 )
             )
             idx_line = build_line_plot(

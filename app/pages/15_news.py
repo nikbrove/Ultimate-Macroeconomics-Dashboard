@@ -1,3 +1,11 @@
+"""News explorer — browse the Qdrant news corpus by topic.
+
+Each Qdrant collection is one topic; the page lists collections, lets
+the user pick an article, renders the cleaned title/body/metadata,
+shows a word-cloud built from every article in the topic, and finds
+nearest-neighbour articles via the article's embedding.
+"""
+
 import json
 import re
 from threading import RLock
@@ -16,7 +24,6 @@ from core.qdrant_client import (
     scroll_collection,
 )
 from core.theming import get_color
-
 
 PAGE_TITLE = "News Explorer"
 DEFAULT_NEAREST_COUNT = 5
@@ -41,11 +48,13 @@ METADATA_FIELDS: list = [
 
 
 def _as_non_empty_string(value: Any) -> str:
+    """Coerce ``value`` to a stripped string (empty string when ``None``)."""
     text = str(value or "").strip()
     return text
 
 
 def _extract_article(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return the nested ``article`` dict from a Qdrant point payload."""
     article = payload.get("article")
     if isinstance(article, dict):
         return article
@@ -53,6 +62,7 @@ def _extract_article(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _sanitize_article_text(text: str) -> str:
+    """Strip markdown headers / HTML heading tags and collapse blank lines."""
     cleaned_lines: list[str] = []
     for raw_line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
         line = HTML_HEADING_TAG_RE.sub("", raw_line).rstrip()
@@ -69,6 +79,7 @@ def _sanitize_article_text(text: str) -> str:
 
 
 def _is_non_empty_metadata_value(value: Any) -> bool:
+    """Return ``True`` when ``value`` is a non-empty scalar or non-empty container."""
     if value is None:
         return False
     if isinstance(value, str):
@@ -79,6 +90,7 @@ def _is_non_empty_metadata_value(value: Any) -> bool:
 
 
 def _get_nested_metadata_value(source: dict[str, Any], field_name: str) -> Any:
+    """Resolve ``"thread/country"``-style paths against a nested dict."""
     if field_name in source:
         return source.get(field_name)
 
@@ -91,9 +103,8 @@ def _get_nested_metadata_value(source: dict[str, Any], field_name: str) -> Any:
     return current
 
 
-def _find_metadata_value(
-    article: dict[str, Any], payload: dict[str, Any], field_name: str
-) -> Any:
+def _find_metadata_value(article: dict[str, Any], payload: dict[str, Any], field_name: str) -> Any:
+    """Look up ``field_name`` in the article first, then fall back to the payload."""
     article_value = _get_nested_metadata_value(article, field_name)
     if _is_non_empty_metadata_value(article_value):
         return article_value
@@ -106,6 +117,7 @@ def _find_metadata_value(
 
 
 def _extract_title(payload: dict[str, Any], point_id: str) -> str:
+    """Return the first non-empty title candidate or ``"Untitled news (id)"`` as a fallback."""
     article = _extract_article(payload)
     candidates = [
         article.get("title"),
@@ -123,6 +135,7 @@ def _extract_title(payload: dict[str, Any], point_id: str) -> str:
 
 
 def _extract_thread_text(payload: dict[str, Any]) -> str:
+    """Return the article-thread body collapsed onto a single line."""
     thread = payload.get("thread")
     if not isinstance(thread, dict):
         return ""
@@ -135,6 +148,7 @@ def _extract_thread_text(payload: dict[str, Any]) -> str:
 
 
 def _extract_text(payload: dict[str, Any]) -> str:
+    """Return the sanitised article body (text/content/body), or a placeholder when missing."""
     article = _extract_article(payload)
     candidates = [
         article.get("text"),
@@ -153,6 +167,7 @@ def _extract_text(payload: dict[str, Any]) -> str:
 
 
 def _extract_source_url(payload: dict[str, Any]) -> str:
+    """Return the first non-empty article URL candidate (or ``""``)."""
     article = _extract_article(payload)
     candidates = [
         article.get("url"),
@@ -169,33 +184,34 @@ def _extract_source_url(payload: dict[str, Any]) -> str:
 
 
 def _build_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return the subset of :data:`METADATA_FIELDS` that are populated for this article."""
     article = _extract_article(payload)
     filtered_metadata: dict[str, Any] = {}
     for field_name in METADATA_FIELDS:
-        value = _find_metadata_value(
-            article=article, payload=payload, field_name=field_name
-        )
+        value = _find_metadata_value(article=article, payload=payload, field_name=field_name)
         if _is_non_empty_metadata_value(value):
             filtered_metadata[field_name] = value
     return filtered_metadata
 
 
 def _extract_query_vector(vector: Any) -> list[float] | None:
+    """Normalise Qdrant's various ``vector`` shapes into a single ``list[float]``."""
     if isinstance(vector, list):
-        return vector
+        return [float(v) for v in vector]
     if isinstance(vector, tuple):
-        return list(vector)
+        return [float(v) for v in vector]
     if isinstance(vector, dict):
         for candidate in vector.values():
             if isinstance(candidate, list):
-                return candidate
+                return [float(v) for v in candidate]
             if isinstance(candidate, tuple):
-                return list(candidate)
+                return [float(v) for v in candidate]
     return None
 
 
 @st.cache_data(show_spinner=False, ttl=300)
 def _load_topic_news_bundle(collection_name: str) -> dict[str, Any]:
+    """Scroll every point in a topic and return display items + word-cloud corpus."""
     records = scroll_collection(collection_name=collection_name)
     items: list[dict[str, Any]] = []
     thread_text_parts: list[str] = []
@@ -212,10 +228,7 @@ def _load_topic_news_bundle(collection_name: str) -> dict[str, Any]:
         else:
             label = title
 
-        if (
-            article_text
-            and article_text != "No article text is available for this record."
-        ):
+        if article_text and article_text != "No article text is available for this record.":
             thread_text_parts.append(re.sub(r"\s+", " ", article_text).strip())
 
         items.append(
@@ -238,6 +251,7 @@ def _load_topic_news_bundle(collection_name: str) -> dict[str, Any]:
 
 @st.cache_data(show_spinner=False, ttl=300)
 def _build_wordcloud_image(topic_corpus: str) -> Any:
+    """Render the topic-corpus word cloud as a numpy array; return ``None`` when empty."""
     normalized_corpus = re.sub(r"\s+", " ", topic_corpus).strip()
     if not normalized_corpus:
         return None
@@ -261,6 +275,7 @@ def _build_wordcloud_image(topic_corpus: str) -> Any:
 
 @st.fragment
 def _render_topic_wordcloud(topic_corpus: str, source_count: int) -> None:
+    """Render the topic word-cloud panel; rerenders independently as a fragment."""
     with st.container(border=True):
         st.markdown("### Topic Word Cloud")
         st.caption(f"Included records with text: {source_count}.")
@@ -283,6 +298,7 @@ def _render_topic_wordcloud(topic_corpus: str, source_count: int) -> None:
 
 
 def _show_selected_news(selected_item: dict[str, Any], show_metadata: bool) -> None:
+    """Render the selected article's title, source-link button, body, and optional metadata JSON."""
     st.subheader(selected_item["title"])
 
     source_url = selected_item.get("source_url")
@@ -305,6 +321,7 @@ def _render_nearest_news(
     id_to_item: dict[str, dict[str, Any]],
     select_state_key: str,
 ) -> None:
+    """Render the "Find similar articles" button and, when clicked, the result list."""
     if not st.button(
         f"Find {DEFAULT_NEAREST_COUNT} nearest news",
         width="stretch",
@@ -347,14 +364,13 @@ def _render_nearest_news(
 
         score_text = f"{hit.score:.4f}" if hit.score is not None else "N/A"
         label = f"{idx}. {title} (score: {score_text})"
-        if st.button(
-            label, key=f"nearest_{collection_name}_{hit_id}", width="stretch"
-        ):
+        if st.button(label, key=f"nearest_{collection_name}_{hit_id}", width="stretch"):
             st.session_state[select_state_key] = hit_id
             st.rerun()
 
 
 def render_news_page() -> None:
+    """Page entry-point: topic picker, article picker, body, word-cloud, nearest articles."""
     log_page_render(PAGE_TITLE)
     st.title(PAGE_TITLE)
     st.caption(
@@ -400,9 +416,7 @@ def render_news_page() -> None:
         st.session_state[select_state_key] = ordered_ids[0]
 
     st.markdown("### News Finder")
-    st.caption(
-        "Starts with Qdrant ordering. Type to filter suggestions in the selector."
-    )
+    st.caption("Starts with Qdrant ordering. Type to filter suggestions in the selector.")
     selected_news_id = st.selectbox(
         "Find and select a piece of news",
         options=ordered_ids,

@@ -28,6 +28,15 @@ themes:
       sector_agriculture: "#34d399"
       sector_manufacturing: "#f59e0b"
       sector_services: "#60a5fa"
+      diverging_low: "#60a5fa"
+      diverging_mid: "#1e293b"
+      diverging_high: "#f87171"
+      sequential_low: "#0e1117"
+      sequential_high: "#10c8f1"
+      card_title_color: "#94a3b8"
+      confidence_band_alpha: "0.18"
+      wordcloud_background: "#0e1117"
+      wordcloud_colormap: "viridis"
 
   dark-blue:
     streamlit:
@@ -57,6 +66,15 @@ themes:
       sector_agriculture: "#22d3ee"
       sector_manufacturing: "#a78bfa"
       sector_services: "#60a5fa"
+      diverging_low: "#38bdf8"
+      diverging_mid: "#1e293b"
+      diverging_high: "#fb7185"
+      sequential_low: "#0b1c3a"
+      sequential_high: "#60a5fa"
+      card_title_color: "#94a3b8"
+      confidence_band_alpha: "0.20"
+      wordcloud_background: "#0b1c3a"
+      wordcloud_colormap: "cool"
 
   light-green:
     streamlit:
@@ -86,3 +104,12 @@ themes:
       sector_agriculture: "#15803d"
       sector_manufacturing: "#b45309"
       sector_services: "#0369a1"
+      diverging_low: "#0369a1"
+      diverging_mid: "#f1f5f9"
+      diverging_high: "#b91c1c"
+      sequential_low: "#f7faf5"
+      sequential_high: "#15803d"
+      card_title_color: "#334155"
+      confidence_band_alpha: "0.18"
+      wordcloud_background: "#f7faf5"
+      wordcloud_colormap: "Greens"

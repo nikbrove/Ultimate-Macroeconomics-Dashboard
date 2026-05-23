@@ -1,18 +1,26 @@
-import plotly.express as px
+"""General-economics indicator page — entry for the "Dashboard" navigation group.
+
+Renders three sections: (1) a global GDP snapshot with summary cards and the
+top-10-by-GDP table, (2) the standard set of WB indicators driven by
+:func:`pages.page_utils.render_page_from_config`, and (3) a Hans-Rosling-style
+animated bubble chart (GDP per capita × life expectancy × population by region).
+"""
+
+import math
+
 import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
 
 from core.assets import get_markup_template, render_markup_template
-from core.plotting import apply_plotly_theme
-from core.theming import get_color
 from core.page_helpers import fetch_indicator_slice
+from core.plotting import apply_plotly_theme
 from core.postgres_client import (
     get_world_bank_country_mapping,
     get_world_bank_country_regions,
 )
+from core.theming import get_color, get_colorway
 from pages.page_utils import render_page_from_config
-
 
 LIFE_EXP_INDICATOR_ID = "SP.DYN.LE00.IN"
 POPULATION_INDICATOR_ID = "SP.POP.TOTL"
@@ -26,6 +34,7 @@ PAGE_TITLE = "General Economics Indicators"
 
 
 def _format_large_usd(value: float) -> str:
+    """Render a USD amount with ``T/B/M`` suffix and dollar sign."""
     abs_value = abs(value)
     if abs_value >= 1_000_000_000_000:
         return f"${value / 1_000_000_000_000:.2f}T"
@@ -41,15 +50,23 @@ def _compute_summary(
     aggregation: str,
     target_year: int | None = None,
 ) -> dict[str, float | int | None] | None:
+    """Aggregate an indicator for one target year and compute YoY change.
+
+    Args:
+        indicator_df: Frame with ``year``/``economy``/``value`` columns.
+        aggregation: ``"sum"`` (totals) or ``"mean"`` (averages).
+        target_year: Preferred year; falls back to the latest available
+            when missing.
+
+    Returns:
+        Dict with ``target_year``, ``previous_year``, ``target_value``,
+        and ``pct_change`` (or ``None`` when the frame is empty).
+    """
     if indicator_df.is_empty():
         return None
 
     available_years = (
-        indicator_df.select(pl.col("year"))
-        .unique()
-        .sort("year")
-        .get_column("year")
-        .to_list()
+        indicator_df.select(pl.col("year")).unique().sort("year").get_column("year").to_list()
     )
     if not available_years:
         return None
@@ -78,9 +95,7 @@ def _compute_summary(
 
     target_value = float(target_year_df.select(agg_expr).item() or 0.0)
     previous_value = (
-        float(previous_year_df.select(agg_expr).item() or 0.0)
-        if previous_year is not None
-        else 0.0
+        float(previous_year_df.select(agg_expr).item() or 0.0) if previous_year is not None else 0.0
     )
 
     pct_change = None
@@ -101,14 +116,13 @@ def _render_snapshot_card(
     pct_change: float | None,
     previous_year: int | None,
 ) -> None:
+    """Draw one bordered summary card with value, YoY delta, and trend colour."""
     trend_is_positive = pct_change is None or pct_change >= 0
     trend_color = get_color("positive") if trend_is_positive else get_color("negative")
     delta_prefix = "+" if pct_change is not None and pct_change >= 0 else ""
 
     if pct_change is None:
-        comparison_label = (
-            str(previous_year) if previous_year is not None else "previous year"
-        )
+        comparison_label = str(previous_year) if previous_year is not None else "previous year"
         delta_text = f"Change vs {comparison_label}: n/a"
     else:
         delta_text = f"{delta_prefix}{pct_change:.2f}% vs {previous_year}"
@@ -120,6 +134,7 @@ def _render_snapshot_card(
                 min_height=SUMMARY_CARD_MIN_HEIGHT,
                 title=title,
                 trend_color=trend_color,
+                card_title_color=get_color("card_title_color"),
                 formatted_value=_format_large_usd(value),
                 delta_text=delta_text,
             ),
@@ -128,6 +143,7 @@ def _render_snapshot_card(
 
 
 def _build_gdp_share_pie(share_df: pl.DataFrame, title: str) -> go.Figure:
+    """Build the "GDP share of world total" pie chart."""
     fig = go.Figure(
         data=[
             go.Pie(
@@ -147,6 +163,7 @@ def _build_gdp_share_pie(share_df: pl.DataFrame, title: str) -> go.Figure:
 
 
 def _render_gdp_overview() -> None:
+    """Render the GDP snapshot block (summary cards + top-10 table + share pie)."""
     gdp_df = fetch_indicator_slice(GDP_INDICATOR_ID)
     gdp_per_capita_df = fetch_indicator_slice(GDP_PER_CAPITA_INDICATOR_ID)
 
@@ -161,16 +178,10 @@ def _render_gdp_overview() -> None:
 
     target_year = int(gdp_summary["target_year"])
     previous_year = (
-        int(gdp_summary["previous_year"])
-        if gdp_summary["previous_year"] is not None
-        else None
+        int(gdp_summary["previous_year"]) if gdp_summary["previous_year"] is not None else None
     )
     total_target = float(gdp_summary["target_value"])
-    pct_change = (
-        float(gdp_summary["pct_change"])
-        if gdp_summary["pct_change"] is not None
-        else None
-    )
+    pct_change = float(gdp_summary["pct_change"]) if gdp_summary["pct_change"] is not None else None
 
     gdp_per_capita_summary = (
         _compute_summary(
@@ -188,9 +199,7 @@ def _render_gdp_overview() -> None:
         return
 
     country_map = get_world_bank_country_mapping()
-    if not country_map.is_empty() and {"id", "value"}.issubset(
-        set(country_map.columns)
-    ):
+    if not country_map.is_empty() and {"id", "value"}.issubset(set(country_map.columns)):
         country_map = country_map.select(
             [
                 pl.col("id").cast(pl.Utf8).str.to_uppercase().alias("economy"),
@@ -219,9 +228,7 @@ def _render_gdp_overview() -> None:
             pl.col("value"),
         ]
     )
-    other_value = total_target - float(
-        pie_df.select(pl.col("value").sum()).item() or 0.0
-    )
+    other_value = total_target - float(pie_df.select(pl.col("value").sum()).item() or 0.0)
     if ranked_gdp_df.height > 10 and other_value > 0:
         pie_df = pl.concat(
             [
@@ -282,6 +289,7 @@ def _render_gdp_overview() -> None:
 
 
 def _render_development_transition_deep_dive() -> None:
+    """Render the animated Hans-Rosling bubble chart at the bottom of the page."""
     st.divider()
     st.subheader("Development Transition (Hans-Rosling animation)")
     st.caption(
@@ -300,9 +308,7 @@ def _render_development_transition_deep_dive() -> None:
         return
 
     regions_df = get_world_bank_country_regions()
-    if regions_df.is_empty() or not {"id", "value", "region"}.issubset(
-        set(regions_df.columns)
-    ):
+    if regions_df.is_empty() or not {"id", "value", "region"}.issubset(set(regions_df.columns)):
         st.info("Country region metadata is unavailable.")
         return
 
@@ -318,9 +324,7 @@ def _render_development_transition_deep_dive() -> None:
         gdp_pc.join(life_exp, on=["year", "economy"])
         .join(pop, on=["year", "economy"])
         .join(regions_df, on="economy", how="inner")
-        .filter(
-            (pl.col("gdp_pc") > 0) & (pl.col("life_exp") > 0) & (pl.col("pop") > 0)
-        )
+        .filter((pl.col("gdp_pc") > 0) & (pl.col("life_exp") > 0) & (pl.col("pop") > 0))
         .sort(["year", "economy"])
     )
 
@@ -329,35 +333,133 @@ def _render_development_transition_deep_dive() -> None:
         return
 
     plot_df = joined.to_pandas().sort_values(["year", "country_name"])
-    fig = px.scatter(
-        plot_df,
-        x="gdp_pc",
-        y="life_exp",
-        size="pop",
-        color="region",
-        animation_frame="year",
-        animation_group="economy",
-        hover_name="country_name",
-        hover_data={"economy": True, "gdp_pc": ":,.0f", "life_exp": ":.1f", "pop": ":,.0f", "region": True, "year": False},
-        log_x=True,
-        size_max=55,
-        range_x=[
-            max(100.0, float(plot_df["gdp_pc"].min()) * 0.8),
-            float(plot_df["gdp_pc"].max()) * 1.2,
-        ],
-        range_y=[
+    regions = sorted(plot_df["region"].dropna().unique().tolist())
+    years = sorted(plot_df["year"].dropna().unique().tolist())
+    palette = get_colorway()
+    region_colors = {
+        region: palette[idx % len(palette)] if palette else None
+        for idx, region in enumerate(regions)
+    }
+    pop_max = float(plot_df["pop"].max() or 1.0)
+    sizeref = 2.0 * pop_max / (55.0 * 55.0)
+
+    def _build_year_traces(year_value: int) -> list[go.Scatter]:
+        """Return one scatter trace per region for the given year."""
+        year_df = plot_df[plot_df["year"] == year_value]
+        traces: list[go.Scatter] = []
+        for region in regions:
+            sub = year_df[year_df["region"] == region]
+            traces.append(
+                go.Scatter(
+                    x=sub["gdp_pc"],
+                    y=sub["life_exp"],
+                    mode="markers",
+                    name=region,
+                    marker={
+                        "size": sub["pop"],
+                        "sizemode": "area",
+                        "sizeref": sizeref,
+                        "sizemin": 4,
+                        "color": region_colors[region],
+                        "opacity": 0.7,
+                        "line": {"width": 0.5},
+                    },
+                    text=sub["country_name"],
+                    customdata=sub[["economy", "gdp_pc", "life_exp", "pop", "region"]].to_numpy(),
+                    hovertemplate=(
+                        "<b>%{text}</b> (%{customdata[0]})<br>"
+                        "Region: %{customdata[4]}<br>"
+                        "GDP per capita: %{customdata[1]:,.0f}<br>"
+                        "Life expectancy: %{customdata[2]:.1f}<br>"
+                        "Population: %{customdata[3]:,.0f}<extra></extra>"
+                    ),
+                )
+            )
+        return traces
+
+    initial_traces = _build_year_traces(years[0])
+    frames = [
+        go.Frame(data=_build_year_traces(year_value), name=str(year_value)) for year_value in years
+    ]
+
+    x_min = max(100.0, float(plot_df["gdp_pc"].min()) * 0.8)
+    x_max = float(plot_df["gdp_pc"].max()) * 1.2
+
+    fig = go.Figure(data=initial_traces, frames=frames)
+    fig.update_layout(
+        title="Income vs Longevity over time",
+        xaxis_title="GDP per capita (US$, log)",
+        yaxis_title="Life expectancy at birth (years)",
+        xaxis_type="log",
+        xaxis_range=[math.log10(x_min), math.log10(x_max)],
+        yaxis_range=[
             float(plot_df["life_exp"].min()) - 2.0,
             float(plot_df["life_exp"].max()) + 2.0,
         ],
-        labels={
-            "gdp_pc": "GDP per capita (US$, log)",
-            "life_exp": "Life expectancy at birth (years)",
-            "pop": "Population",
-            "region": "Region",
-        },
-        title="Income vs Longevity over time",
+        margin={"l": 60, "r": 40, "t": 60, "b": 110},
+        updatemenus=[
+            {
+                "type": "buttons",
+                "direction": "left",
+                "showactive": False,
+                "x": 0.1,
+                "xanchor": "right",
+                "y": 0,
+                "yanchor": "top",
+                "pad": {"r": 10, "t": 70},
+                "buttons": [
+                    {
+                        "label": "Play",
+                        "method": "animate",
+                        "args": [
+                            None,
+                            {
+                                "frame": {"duration": 500, "redraw": True},
+                                "fromcurrent": True,
+                            },
+                        ],
+                    },
+                    {
+                        "label": "Pause",
+                        "method": "animate",
+                        "args": [
+                            [None],
+                            {
+                                "frame": {"duration": 0, "redraw": False},
+                                "mode": "immediate",
+                            },
+                        ],
+                    },
+                ],
+            }
+        ],
+        sliders=[
+            {
+                "active": 0,
+                "x": 0.1,
+                "xanchor": "left",
+                "y": 0,
+                "yanchor": "top",
+                "len": 0.9,
+                "pad": {"b": 10, "t": 50},
+                "currentvalue": {"prefix": "Year: "},
+                "steps": [
+                    {
+                        "args": [
+                            [str(year_value)],
+                            {
+                                "frame": {"duration": 0, "redraw": True},
+                                "mode": "immediate",
+                            },
+                        ],
+                        "label": str(year_value),
+                        "method": "animate",
+                    }
+                    for year_value in years
+                ],
+            }
+        ],
     )
-    fig.update_traces(marker={"opacity": 0.7, "line": {"width": 0.5}})
     fig = apply_plotly_theme(fig)
 
     st.plotly_chart(fig, width="stretch")

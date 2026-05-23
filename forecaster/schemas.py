@@ -1,21 +1,35 @@
-from pydantic import BaseModel, Field, field_validator
-from typing import List, Literal
+"""Pydantic request/response schemas for the forecasting FastAPI service."""
+
 import math
+from typing import List, Literal
+
+from pydantic import BaseModel, Field, field_validator
 
 
 class ForecastRequest(BaseModel):
+    """Body accepted by ``POST /predict``.
+
+    Args:
+        model_type: Which underlying model to use (``prophet``, ``chronos``,
+            ``arima``). Models can be disabled via ``config.yaml`` toggles;
+            requesting a disabled model yields a 400.
+        dates: ISO timestamps for the historical points (aligned to ``values``).
+        values: Historical observations; must be the same length as ``dates``
+            and contain only finite numbers.
+        n_prev: How many trailing points to keep as context for fitting
+            (truncates ``dates`` / ``values`` if smaller than their length).
+        n_predict: How many future points to produce.
+        alpha: Significance level for confidence intervals (e.g. ``0.05`` -> 95%).
+    """
+
     model_type: Literal["prophet", "chronos", "arima"] = Field(
         default="prophet", description="Choose the forecasting model."
     )
 
-    dates: List[str] = Field(
-        ..., description="Timestamps for the historical data (ISO format)."
-    )
+    dates: List[str] = Field(..., description="Timestamps for the historical data (ISO format).")
     values: List[float] = Field(..., description="Historical time series values.")
 
-    n_prev: int = Field(
-        ..., gt=0, description="Number of previous points to consider for fitting."
-    )
+    n_prev: int = Field(..., gt=0, description="Number of previous points to consider for fitting.")
     n_predict: int = Field(..., gt=0, description="Number of future points to predict.")
     alpha: float = Field(
         0.05,
@@ -26,6 +40,7 @@ class ForecastRequest(BaseModel):
 
     @field_validator("values")
     def check_lengths_match(cls, v, info):
+        """Reject mismatched lengths, empty inputs, and non-finite numbers."""
         if "dates" in info.data and len(v) != len(info.data["dates"]):
             raise ValueError("The number of dates and values must be strictly equal.")
         if len(v) == 0:
@@ -36,6 +51,15 @@ class ForecastRequest(BaseModel):
 
 
 class ForecastPoint(BaseModel):
+    """One predicted point with its confidence interval.
+
+    Args:
+        ds: Timestamp formatted as ``%Y-%m-%d %H:%M:%S``.
+        yhat: Point forecast.
+        yhat_lower: Lower bound of the confidence interval.
+        yhat_upper: Upper bound of the confidence interval.
+    """
+
     ds: str
     yhat: float
     yhat_lower: float
@@ -43,5 +67,12 @@ class ForecastPoint(BaseModel):
 
 
 class ForecastResponse(BaseModel):
+    """Response returned by ``POST /predict``.
+
+    Args:
+        model_used: Echo of the model that produced the forecast.
+        forecast: Future points sorted ascending by timestamp.
+    """
+
     model_used: str
     forecast: List[ForecastPoint]

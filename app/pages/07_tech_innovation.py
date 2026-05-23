@@ -1,16 +1,20 @@
-import plotly.express as px
+"""Technology and innovation page — R&D spending, high-tech exports, digital adoption.
+
+Custom blocks: an R&D-intensity × high-tech-export bubble chart sized by
+GDP, and a deep-dive on digital adoption (internet, mobile, broadband).
+"""
+
 import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
 
 from core.page_helpers import fetch_indicator_slice
 from core.plotting import apply_plotly_theme
-from core.theming import get_color, get_colorway
 from core.postgres_client import (
     get_world_bank_country_mapping,
 )
-from pages.page_utils import render_page_from_config
-
+from core.theming import get_color, get_colorway
+from pages.page_utils import get_shared_selected_countries, render_page_from_config
 
 PAGE_TITLE = "Technology and Innovations"
 RND_INDICATOR_ID = "GB.XPD.RSDV.GD.ZS"
@@ -19,6 +23,7 @@ GDP_INDICATOR_ID = "NY.GDP.MKTP.CD"
 
 
 def _render_rd_vs_hightech_overview() -> None:
+    """Render the R&D × high-tech-exports bubble chart at the top of the page."""
     st.subheader("R&D Intensity vs High-Tech Exports")
     st.caption(
         "Cross-country relationship between research spending and high-tech "
@@ -30,9 +35,7 @@ def _render_rd_vs_hightech_overview() -> None:
     gdp_df = fetch_indicator_slice(GDP_INDICATOR_ID, value_col="gdp_usd")
 
     if rnd_df.is_empty() or hightech_df.is_empty():
-        st.info(
-            "R&D vs high-tech scatter is unavailable because source data is empty."
-        )
+        st.info("R&D vs high-tech scatter is unavailable because source data is empty.")
         st.divider()
         return
 
@@ -47,9 +50,7 @@ def _render_rd_vs_hightech_overview() -> None:
         return
 
     country_map = get_world_bank_country_mapping()
-    if not country_map.is_empty() and {"id", "value"}.issubset(
-        set(country_map.columns)
-    ):
+    if not country_map.is_empty() and {"id", "value"}.issubset(set(country_map.columns)):
         country_map = country_map.select(
             [
                 pl.col("id").cast(pl.Utf8).str.to_uppercase().alias("economy"),
@@ -66,13 +67,9 @@ def _render_rd_vs_hightech_overview() -> None:
             pl.col("gdp_usd").fill_null(0.0).alias("gdp_usd"),
         )
 
-    year_options = (
-        joined_df.select("year").unique().sort("year").get_column("year").to_list()
-    )
+    year_options = joined_df.select("year").unique().sort("year").get_column("year").to_list()
     if not year_options:
-        st.info(
-            "R&D vs high-tech scatter is unavailable because years are missing."
-        )
+        st.info("R&D vs high-tech scatter is unavailable because years are missing.")
         st.divider()
         return
 
@@ -91,7 +88,7 @@ def _render_rd_vs_hightech_overview() -> None:
 
     selected_countries = {
         str(code).strip().upper()
-        for code in st.session_state.get(f"{PAGE_TITLE}_countries", [])
+        for code in get_shared_selected_countries()
         if str(code).strip()
     }
     year_df = year_df.with_columns(
@@ -102,36 +99,47 @@ def _render_rd_vs_hightech_overview() -> None:
     )
 
     plot_df = year_df.to_pandas()
-    size_kwargs: dict = {}
-    if "gdp_usd" in plot_df.columns and plot_df["gdp_usd"].fillna(0).gt(0).any():
-        size_kwargs = {"size": "gdp_usd", "size_max": 45}
+    has_gdp_size = "gdp_usd" in plot_df.columns and plot_df["gdp_usd"].fillna(0).gt(0).any()
+    gdp_max = float(plot_df["gdp_usd"].max()) if has_gdp_size else 1.0
+    sizeref = (2.0 * gdp_max / (45.0 * 45.0)) if has_gdp_size and gdp_max > 0 else 1.0
 
-    fig = px.scatter(
-        plot_df,
-        x="rnd_pct_gdp",
-        y="hightech_usd",
-        color="country_group",
-        category_orders={"country_group": ["Other", "Selected"]},
-        color_discrete_map={
-            "Other": get_color("reference_line"),
-            "Selected": get_colorway()[0],
-        },
-        hover_name="country_name",
-        hover_data={
-            "economy": True,
-            "rnd_pct_gdp": ":.2f",
-            "hightech_usd": ":,.0f",
-            "country_group": False,
-        },
-        labels={
-            "rnd_pct_gdp": "R&D expenditure (% of GDP)",
-            "hightech_usd": "High-tech exports (current US$, log)",
-            "country_group": "",
-        },
-        title=f"R&D Intensity vs High-Tech Exports ({selected_year})",
-        log_y=True,
-        **size_kwargs,
-    )
+    fig = go.Figure()
+    group_colors = {
+        "Other": get_color("reference_line"),
+        "Selected": get_colorway()[0],
+    }
+    for group_name in ("Other", "Selected"):
+        group_rows = plot_df[plot_df["country_group"] == group_name]
+        if group_rows.empty:
+            continue
+        marker: dict = {
+            "color": group_colors[group_name],
+            "opacity": 0.78,
+            "line": {"width": 0.5},
+        }
+        if has_gdp_size:
+            marker["size"] = group_rows["gdp_usd"].fillna(0)
+            marker["sizemode"] = "area"
+            marker["sizeref"] = sizeref
+            marker["sizemin"] = 4
+        else:
+            marker["size"] = 9
+        fig.add_trace(
+            go.Scatter(
+                x=group_rows["rnd_pct_gdp"],
+                y=group_rows["hightech_usd"],
+                mode="markers",
+                name=group_name,
+                marker=marker,
+                text=group_rows["country_name"],
+                customdata=group_rows[["economy"]].to_numpy(),
+                hovertemplate=(
+                    "<b>%{text}</b> (%{customdata[0]})<br>"
+                    "R&D: %{x:.2f}% of GDP<br>"
+                    "High-tech exports: %{y:,.0f} US$<extra></extra>"
+                ),
+            )
+        )
 
     selected_df = plot_df[plot_df["country_group"] == "Selected"]
     if not selected_df.empty:
@@ -147,9 +155,11 @@ def _render_rd_vs_hightech_overview() -> None:
             )
         )
 
-    fig.update_traces(
-        selector={"mode": "markers"},
-        marker={"opacity": 0.78, "line": {"width": 0.5}},
+    fig.update_layout(
+        title=f"R&D Intensity vs High-Tech Exports ({selected_year})",
+        xaxis_title="R&D expenditure (% of GDP)",
+        yaxis_title="High-tech exports (current US$, log)",
+        yaxis_type="log",
     )
     fig = apply_plotly_theme(fig)
 
@@ -168,6 +178,7 @@ DIGITAL_MAX_LINES = 6
 
 
 def _render_digital_adoption_deep_dive() -> None:
+    """Render the digital-adoption (internet/mobile/broadband) chart at the bottom of the page."""
     st.divider()
     st.subheader("Digital Adoption — Internet & Mobile (time series)")
     st.caption(
@@ -186,7 +197,7 @@ def _render_digital_adoption_deep_dive() -> None:
 
     selected_iso_codes = [
         str(c).strip().upper()
-        for c in st.session_state.get(f"{PAGE_TITLE}_countries", [])
+        for c in get_shared_selected_countries()
         if str(c).strip()
     ][:DIGITAL_MAX_LINES]
 
@@ -231,8 +242,16 @@ def _render_digital_adoption_deep_dive() -> None:
                     )
                 )
     else:
-        inet_mean = internet.group_by("year").agg(pl.col("internet_pct").mean().alias("internet_pct")).sort("year")
-        mob_mean = mobile.group_by("year").agg(pl.col("mobile_per_100").mean().alias("mobile_per_100")).sort("year")
+        inet_mean = (
+            internet.group_by("year")
+            .agg(pl.col("internet_pct").mean().alias("internet_pct"))
+            .sort("year")
+        )
+        mob_mean = (
+            mobile.group_by("year")
+            .agg(pl.col("mobile_per_100").mean().alias("mobile_per_100"))
+            .sort("year")
+        )
         fig.add_trace(
             go.Scatter(
                 x=inet_mean["year"].to_list(),

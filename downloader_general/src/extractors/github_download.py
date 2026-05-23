@@ -1,7 +1,34 @@
+"""News pipeline: clone the Webhose news repo, unzip, embed, push to Qdrant.
+
+End-to-end this runs once per clean boot via :meth:`NewsDownloader.run`. Per-zip
+extraction and embedding batches are parallelised with ``ThreadPoolExecutor``;
+collection uploads to Qdrant remain serial because we ``recreate_collection``
+at the start of each.
+"""
+
+import json
+import logging
+import os
+import shutil
 import sys
+import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from pathlib import Path
+from time import sleep
+from urllib.parse import urlparse
+from uuid import uuid4
+from zipfile import ZipFile
+
+import httpx
+from dotenv import load_dotenv
+from git import Repo
+from openai import OpenAI
+from qdrant_client import QdrantClient, models
+from tiktoken import encoding_for_model
+from tqdm import tqdm
 
 from src.core.base_downloaders import BaseNewsDownloader
-
 from src.utils.downloads import (
     CloneProgress,
     _call_with_retries,
@@ -9,34 +36,13 @@ from src.utils.downloads import (
     _remove_readonly,
 )
 
-from git import Repo
-from zipfile import ZipFile
-from tqdm import tqdm
-from time import sleep
-from datetime import datetime
-from uuid import uuid4
-from dotenv import load_dotenv
-from qdrant_client import QdrantClient, models
-from openai import OpenAI
-from tiktoken import encoding_for_model
-
-import os
-import json
-import logging
-import warnings
-import shutil
-from pathlib import Path
-
-import requests
-from urllib.parse import urlparse
-
 logger = logging.getLogger(__name__)
 
 SUPPORTED_ARTICLE_LANGUAGES = {"english", "en"}
 
 
 class NewsDownloader(BaseNewsDownloader):
-    """Downloader and Embedder for news articles from a GitHub repository."""
+    """Clone a news-dataset repo, extract articles, embed, upload to Qdrant."""
 
     def __init__(
         self,
@@ -51,6 +57,21 @@ class NewsDownloader(BaseNewsDownloader):
         openai_token_limit: int = 8192,
         openai_model_dimensions: int = 1536,
     ) -> None:
+        """Capture configuration; OpenAI/Qdrant clients are built lazily.
+
+        Args:
+            env_file: Path to the ``.env`` with ``OPENAI_API_KEY`` and
+                ``QDRANT__SERVICE__API_KEY``.
+            repo_url: GitHub URL of the news dataset to clone.
+            save_path: Local directory where the repo is cloned + unzipped.
+            qdrant_host: Hostname (or full URL) of the Qdrant service.
+            qdrant_port: Port (ignored when ``qdrant_host`` includes a scheme).
+            config_path: Path to the JSON file listing allowed topics.
+            openai_base_url: OpenAI-compatible base URL, or ``None`` for default.
+            openai_embedding_model: Embedding model identifier.
+            openai_token_limit: Max tokens per embedding call (input truncated).
+            openai_model_dimensions: Embedding dimensionality (Qdrant param).
+        """
         self.env_path = Path(env_file)
         self.github_api_url = "https://api.github.com"
 
@@ -73,23 +94,26 @@ class NewsDownloader(BaseNewsDownloader):
         self.embedding_token_limit = openai_token_limit
         self.openai_model_dimensions = openai_model_dimensions
         self.embedding_encoding = self._build_embedding_encoding()
+        # Concurrent embedding batches per collection. The OpenAI SDK is
+        # thread-safe; keep this conservative so we don't blow through the
+        # tokens-per-minute quota in a burst.
+        self.max_parallel_embed_batches = 4
 
     def _initialize_connections(self) -> bool:
         load_dotenv(self.env_path)
         openai_api_key = os.getenv("OPENAI_API_KEY")
         if not openai_api_key:
-            logger.error(
-                "OPENAI_API_KEY is not set; news embeddings cannot be generated"
-            )
+            logger.error("OPENAI_API_KEY is not set; news embeddings cannot be generated")
             return False
-        self.openai_client = OpenAI(
-            base_url=self.openai_base_url, api_key=openai_api_key
-        )
+        self.openai_client = OpenAI(base_url=self.openai_base_url, api_key=openai_api_key)
         try:
-            qdrant_api_key = os.getenv("QDRANT_API_KEY") or os.getenv(
-                "QDRANT__SERVICE__API_KEY"
+            qdrant_api_key = os.getenv("QDRANT_API_KEY") or os.getenv("QDRANT__SERVICE__API_KEY")
+            response = _call_with_retries(
+                operation_name="github_api_probe",
+                request_callable=lambda: httpx.get(self.github_api_url, timeout=30.0),
+                retry_delay_seconds=5.0,
+                max_retries=3,
             )
-            response = requests.get(self.github_api_url, timeout=5)
             qdrant_host = str(self.qdrant_host).strip()
             parsed_host = urlparse(qdrant_host)
             if parsed_host.scheme:
@@ -117,6 +141,9 @@ class NewsDownloader(BaseNewsDownloader):
                 extra={"operation": "Initializing connections", "error": str(exc)},
             )
             return False
+        if response is None:
+            logger.error("GitHub API probe failed after all retries; skipping news download")
+            return False
         if response.status_code == 200 and bool(collections_response):
             parent_dir = self.save_path.resolve().parent
             parent_dir.mkdir(parents=True, exist_ok=True)
@@ -138,9 +165,7 @@ class NewsDownloader(BaseNewsDownloader):
             if token_count <= self.embedding_token_limit:
                 return text
 
-            truncated_text = self.embedding_encoding.decode(
-                token_ids[: self.embedding_token_limit]
-            )
+            truncated_text = self.embedding_encoding.decode(token_ids[: self.embedding_token_limit])
             logger.warning(
                 "Article text truncated for embeddings token limit",
                 extra={
@@ -192,8 +217,96 @@ class NewsDownloader(BaseNewsDownloader):
         self.is_downloaded = clone_result is not None
         return self.is_downloaded
 
+    def _process_archive(
+        self, archive_path: Path, allowed_topics: list[str]
+    ) -> tuple[str, list[dict]] | None:
+        """Extract one zip and collect its JSON article payloads.
+
+        Returns ``(collection_name, entries)`` or ``None`` when the archive is
+        skipped. Pure per-archive work — no shared state — so it is safe to
+        call from a ``ThreadPoolExecutor`` worker.
+        """
+        if archive_path.suffix != ".zip":
+            return None
+
+        base_name = archive_path.stem
+        parts = base_name.rsplit("_", 2)
+        if len(parts) != 3:
+            logger.warning(
+                "Skipping news archive with unexpected name format: %s",
+                archive_path.name,
+            )
+            return None
+        topic, sentiment, date_str = parts
+        if topic not in allowed_topics:
+            return None
+
+        topic_normalized = topic.strip().lower()
+        parsed_date = datetime.strptime(date_str, "%Y%m%d%H%M%S").date().isoformat()
+
+        zip_path = archive_path
+        extract_dir = self.save_path / base_name
+        collection_name = (
+            f"{topic_normalized}_{sentiment}".replace(" ", "_").replace(",", " ").lower()
+        )
+
+        extract_dir.mkdir(parents=True, exist_ok=True)
+
+        with ZipFile(zip_path, "r") as zip_ref:
+            zip_ref.extractall(extract_dir)
+
+        nested_extract_dir = extract_dir / base_name
+        if nested_extract_dir.is_dir():
+            for nested_item in nested_extract_dir.iterdir():
+                shutil.move(
+                    str(nested_item),
+                    str(extract_dir / nested_item.name),
+                )
+            shutil.rmtree(nested_extract_dir, onexc=_remove_readonly)
+
+        entries: list[dict] = []
+        for article_file_path in sorted(extract_dir.rglob("*.json")):
+            try:
+                article_payload = json.loads(article_file_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.warning(
+                    f"Skipping invalid article file: {article_file_path}",
+                    extra={
+                        "operation": "Parsing article JSON",
+                        "error": str(exc),
+                    },
+                )
+                continue
+
+            article_language = str(article_payload.get("language", "")).strip().lower()
+            if article_language not in SUPPORTED_ARTICLE_LANGUAGES:
+                logger.info(
+                    "Skipping article with unsupported language metadata",
+                    extra={
+                        "operation": "Parsing article JSON",
+                        "article_file_path": str(article_file_path),
+                        "language": article_payload.get("language"),
+                    },
+                )
+                continue
+
+            entries.append(
+                {
+                    "topic": topic,
+                    "sentiment": sentiment,
+                    "date": parsed_date,
+                    "archive_file": str(zip_path.resolve()),
+                    "extracted_dir": str(extract_dir.resolve()),
+                    "article_file_path": str(article_file_path.resolve()),
+                    "archive_name": base_name,
+                    "article": article_payload,
+                }
+            )
+
+        return collection_name, entries
+
     def parse_repository(self) -> None:
-        metadata = {}
+        metadata: dict[str, list[dict]] = {}
         source_datasets_dir = self.save_path / "News_Datasets"
         allowed_topics = self.download_config
 
@@ -202,97 +315,32 @@ class NewsDownloader(BaseNewsDownloader):
             for entry in source_datasets_dir.iterdir()
             if entry.name.split("_")[0] in allowed_topics
         ]
-        for archive_path in tqdm(
-            iter_files,
-            desc="Unzipping files",
-            dynamic_ncols=True,
-            file=sys.stdout,
-        ):
-            filename = archive_path.name
-            if archive_path.suffix != ".zip":
-                continue
 
-            base_name = archive_path.stem
-            parts = base_name.rsplit("_", 2)
-            if len(parts) != 3:
-                logger.warning(
-                    "Skipping news archive with unexpected name format: %s",
-                    filename,
-                )
-                continue
-            topic, sentiment, date_str = parts
-            if topic in allowed_topics:
-                topic_normalized = topic.strip().lower()
-                parsed_date = (
-                    datetime.strptime(date_str, "%Y%m%d%H%M%S").date().isoformat()
-                )
-
-                zip_path = archive_path
-                extract_dir = self.save_path / base_name
-
-                collection_name = (
-                    f"{topic_normalized}_{sentiment}".replace(" ", "_")
-                    .replace(",", " ")
-                    .lower()
-                )
-
-                extract_dir.mkdir(parents=True, exist_ok=True)
-
-                with ZipFile(zip_path, "r") as zip_ref:
-                    zip_ref.extractall(extract_dir)
-
-                nested_extract_dir = extract_dir / base_name
-                if nested_extract_dir.is_dir():
-                    for nested_item in nested_extract_dir.iterdir():
-                        shutil.move(
-                            str(nested_item),
-                            str(extract_dir / nested_item.name),
-                        )
-                    shutil.rmtree(nested_extract_dir, onexc=_remove_readonly)
-
-                article_file_paths = sorted(extract_dir.rglob("*.json"))
-
-                for article_file_path in article_file_paths:
-                    try:
-                        article_payload = json.loads(
-                            article_file_path.read_text(encoding="utf-8")
-                        )
-                    except (OSError, json.JSONDecodeError) as exc:
-                        logger.warning(
-                            f"Skipping invalid article file: {article_file_path}",
-                            extra={
-                                "operation": "Parsing article JSON",
-                                "error": str(exc),
-                            },
-                        )
-                        continue
-
-                    article_language = (
-                        str(article_payload.get("language", "")).strip().lower()
-                    )
-                    if article_language not in SUPPORTED_ARTICLE_LANGUAGES:
-                        logger.info(
-                            "Skipping article with unsupported language metadata",
-                            extra={
-                                "operation": "Parsing article JSON",
-                                "article_file_path": str(article_file_path),
-                                "language": article_payload.get("language"),
-                            },
-                        )
-                        continue
-
-                    metadata.setdefault(collection_name, []).append(
-                        {
-                            "topic": topic,
-                            "sentiment": sentiment,
-                            "date": parsed_date,
-                            "archive_file": str(zip_path.resolve()),
-                            "extracted_dir": str(extract_dir.resolve()),
-                            "article_file_path": str(article_file_path.resolve()),
-                            "archive_name": base_name,
-                            "article": article_payload,
-                        }
-                    )
+        # Per-archive work is I/O-heavy (zip extraction + lots of small JSON
+        # reads); ThreadPoolExecutor gives a big win without needing processes.
+        max_workers = min(8, (os.cpu_count() or 4))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(self._process_archive, archive_path, allowed_topics): archive_path
+                for archive_path in iter_files
+            }
+            for future in tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc="Unzipping files",
+                dynamic_ncols=True,
+                file=sys.stdout,
+            ):
+                archive_path = futures[future]
+                try:
+                    result = future.result()
+                except Exception:
+                    logger.exception("Failed to process archive: %s", archive_path)
+                    continue
+                if result is None:
+                    continue
+                collection_name, entries = result
+                metadata.setdefault(collection_name, []).extend(entries)
 
         self.parsed_metadata = metadata
         self.is_parsed = True
@@ -332,6 +380,55 @@ class NewsDownloader(BaseNewsDownloader):
             logger.exception("Getting embeddings failed", exc_info=exc)
             return []
 
+    def _embed_batch(
+        self, collection_name: str, batch_start: int, batch_metadata: list[dict]
+    ) -> list[models.PointStruct] | None:
+        """Embed a single batch and build PointStructs. Returns None on failure."""
+        texts_to_embed = [
+            self._truncate_for_embedding(
+                str(meta.get("article", {}).get("text")),
+                meta.get("article_file_path", "unknown"),
+            )
+            for meta in batch_metadata
+        ]
+
+        embeddings = _call_with_retries(
+            "get_embeddings",
+            lambda: self.get_embeddings(texts_to_embed),
+            retry_delay_seconds=3,
+            max_retries=3,
+        )
+
+        if not embeddings:
+            logger.warning(
+                "Skipping batch because embeddings are empty",
+                extra={
+                    "operation": "Embedding and Uploading",
+                    "collection": collection_name,
+                    "batch_start": batch_start,
+                    "batch_size": len(batch_metadata),
+                },
+            )
+            return None
+
+        if len(embeddings) != len(batch_metadata):
+            logger.warning(
+                "Skipping batch due to embedding count mismatch",
+                extra={
+                    "operation": "Embedding and Uploading",
+                    "collection": collection_name,
+                    "batch_start": batch_start,
+                    "metadata_count": len(batch_metadata),
+                    "embedding_count": len(embeddings),
+                },
+            )
+            return None
+
+        return [
+            models.PointStruct(id=str(uuid4()), payload=meta, vector=vector)
+            for meta, vector in zip(batch_metadata, embeddings)
+        ]
+
     def upload_to_qdrant(self) -> None:
         for collection_name, metadata_entries in self.parsed_metadata.items():
             self.qdrant_client.recreate_collection(
@@ -343,69 +440,39 @@ class NewsDownloader(BaseNewsDownloader):
                 on_disk_payload=True,
             )
 
-            for i in tqdm(
-                range(0, len(metadata_entries), self.batch_size),
-                desc=f"Embedding and Uploading: {collection_name}",
-                dynamic_ncols=True,
-                file=sys.stdout,
-            ):
-                batch_metadata = metadata_entries[i : i + self.batch_size]
-
-                texts_to_embed = []
-                for meta in batch_metadata:
-                    article_data = meta.get("article", {})
-                    text = article_data.get("text")
-                    texts_to_embed.append(
-                        self._truncate_for_embedding(
-                            str(text), meta.get("article_file_path", "unknown")
+            batch_starts = list(range(0, len(metadata_entries), self.batch_size))
+            with ThreadPoolExecutor(max_workers=self.max_parallel_embed_batches) as executor:
+                futures = {
+                    executor.submit(
+                        self._embed_batch,
+                        collection_name,
+                        batch_start,
+                        metadata_entries[batch_start : batch_start + self.batch_size],
+                    ): batch_start
+                    for batch_start in batch_starts
+                }
+                for future in tqdm(
+                    as_completed(futures),
+                    total=len(futures),
+                    desc=f"Embedding and Uploading: {collection_name}",
+                    dynamic_ncols=True,
+                    file=sys.stdout,
+                ):
+                    batch_start = futures[future]
+                    try:
+                        points = future.result()
+                    except Exception:
+                        logger.exception(
+                            "Embedding batch failed (collection=%s, batch_start=%s)",
+                            collection_name,
+                            batch_start,
                         )
-                    )
-
-                embeddings = _call_with_retries(
-                    "get_embeddings",
-                    lambda: self.get_embeddings(texts_to_embed),
-                    retry_delay_seconds=3,
-                    max_retries=3,
-                )
-
-                if not embeddings:
-                    logger.warning(
-                        "Skipping batch because embeddings are empty",
-                        extra={
-                            "operation": "Embedding and Uploading",
-                            "collection": collection_name,
-                            "batch_start": i,
-                            "batch_size": len(batch_metadata),
-                        },
-                    )
-                    continue
-
-                if len(embeddings) != len(batch_metadata):
-                    logger.warning(
-                        "Skipping batch due to embedding count mismatch",
-                        extra={
-                            "operation": "Embedding and Uploading",
-                            "collection": collection_name,
-                            "batch_start": i,
-                            "metadata_count": len(batch_metadata),
-                            "embedding_count": len(embeddings),
-                        },
-                    )
-                    continue
-
-                points = []
-                for meta, embedding_vector in zip(batch_metadata, embeddings):
-                    point_id = str(uuid4())
-                    points.append(
-                        models.PointStruct(
-                            id=point_id, payload=meta, vector=embedding_vector
+                        continue
+                    if points:
+                        # qdrant_client is thread-safe; upserts can overlap freely.
+                        self.qdrant_client.upsert(
+                            collection_name=collection_name, points=points
                         )
-                    )
-
-                if points:
-                    self.qdrant_client.upsert(
-                        collection_name=collection_name, points=points
-                    )
 
             sleep(self.download_retry_delay_seconds)
 

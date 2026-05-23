@@ -4,11 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project overview
 
-`Ultimate Macroeconomics Dashboard` is a 10-container Docker stack: a Streamlit multi-page dashboard backed by Postgres + Qdrant, with FastAPI micro-services for the AI analyst, forecasting, clustering, on-demand data ingestion, and a sandboxed Python executor. Read `README.md` for the full description; the sections below cover only what isn't obvious from the code.
+`Ultimate Macroeconomics Dashboard` is a 9-container Docker stack: a Streamlit multi-page dashboard backed by Postgres + Qdrant, with FastAPI micro-services for the AI analyst, forecasting, clustering, on-demand data ingestion, and a sandboxed Python executor. Read `README.md` for the full description; the sections below cover only what isn't obvious from the code.
 
 ## Running the stack
 
-There is no test suite or linter. Everything runs inside containers via Docker Compose. Every service is Python 3.12 and uses [uv](https://docs.astral.sh/uv/) for dependency management — each service has its own `pyproject.toml` + `uv.lock`, and the Dockerfile runs `uv sync --frozen` into `/opt/venv`.
+Linting/formatting is done with `ruff` and type-checking with `ty` (both Astral); each service ships a `[dependency-groups] dev` block with both plus `pytest` and `pytest-cov`. Tests live under `<service>/tests/` and run via `uv run pytest` — `[tool.pytest.ini_options].addopts` enables coverage by default (`--cov --cov-report=term-missing`), with per-service `[tool.coverage.run].source` pointing at that service's package(s). Everything runs inside containers via Docker Compose. Every service is Python 3.12 and uses [uv](https://docs.astral.sh/uv/) for dependency management — each service has its own `pyproject.toml` + `uv.lock`, and the Dockerfile runs `uv sync --frozen` into `/opt/venv`.
 
 ```bash
 # Full stack (build + run, foreground)
@@ -33,7 +33,9 @@ uv add <package>      # add a dependency (updates pyproject.toml + uv.lock)
 uv lock --upgrade     # refresh the lockfile
 ```
 
-First boot requires `_container_data/.env` (copy from `_container_data/.env.example`) and a populated LLM section in `_container_data/config.yaml`. The `db_init` container runs once to provision Postgres roles; `downloader_general` then runs once (~1–2h) to ingest World Bank + Yahoo Finance + Webz.io news. The dashboard is at `http://localhost:8501`.
+First boot requires `_container_data/.env` (copy from `_container_data/.env.example`) and a populated LLM section in `_container_data/config.yaml`. The Postgres image's `init-user.sh` entrypoint creates the superuser on first volume init; `downloader_general` then upserts the read-only LLM role via `src/utils/db_bootstrap.py` (also grants `SELECT` on `public` plus default privileges, so future tables are readable automatically) and runs the ingestion (~1–2h) for World Bank + Yahoo Finance + Webz.io news. The dashboard is at `http://localhost:8501`.
+
+The bootstrap step runs on **every** `downloader_general` container start (cheap, idempotent), so rotating `POSTGRES_LLM_PASSWORD` or adding new tables in a future release takes effect on the next `docker compose up -d downloader_general` without wiping volumes. Only the downloads themselves are one-shot, gated by `_container_data/downloader_general/.download_completed`.
 
 If the host has no NVIDIA GPU, remove the `deploy:` block from the `forecaster` service in `docker-compose.yaml` (the `chronos` model will be skipped; `pmdarima` and `prophet` still work).
 
@@ -45,8 +47,7 @@ If the host has no NVIDIA GPU, remove the `deploy:` block from the `forecaster` 
 | -------------------- | ---- | ------------------------------------------------------------------------------------- |
 | `db`                 | 5432 | Postgres 18 — World Bank + Yahoo Finance tabular data                                 |
 | `vector_db`          | 6333 | Qdrant — news article embeddings                                                      |
-| `db_init`            | —    | One-shot: creates Postgres roles (superuser + read-only `POSTGRES_LLM_*`) and schema  |
-| `downloader_general` | —    | One-shot: clones `Webhose/free-news-datasets`, fetches WB + Yahoo, populates both DBs |
+| `downloader_general` | —    | One-shot: bootstraps the read-only LLM role, clones `Webhose/free-news-datasets`, fetches WB + Yahoo, populates both DBs |
 | `app`                | 8501 | Streamlit dashboard (entry point: `app/app.py`)                                       |
 | `agent`              | 8000 | FastAPI — LangGraph multi-agent AI analyst                                            |
 | `forecaster`         | 8001 | FastAPI — `pmdarima` / `prophet` / `chronos` time-series forecasting                  |
@@ -84,22 +85,26 @@ Entry point `app/app.py` registers the Plotly template, sets up `st.session_stat
 
 ### `agent` (LangGraph supervisor)
 
-`agent/agent/graph.py` (~1k lines) is the heart of the AI analyst. The flow is:
+`agent/agent/graph.py` is the heart of the AI analyst. The flow is:
 
-1. **`GuardrailAgent`** — screens the latest user message; out-of-scope or abusive requests get a polite markdown refusal and skip the rest of the graph.
-2. **`MacroSupervisorAgent`** — plans, picks the next worker, and decides when to finish.
-3. **Workers** (one of `WORKER_NAMES` in `graph.py`):
-   - `sql_agent` — 3-step World Bank exploration + Yahoo Finance lookup, grounded in `database_schema.yaml`.
+1. **`GuardrailAgent`** — heuristic-first screen. Three regexes (auto-allow for short greetings + in-scope keywords, auto-block for clear red flags) decide most messages without an LLM call; only ambiguous ones escalate to the structured-output LLM.
+2. **`MacroSupervisorAgent`** — plans, picks the next worker, and decides FINISH. Branches off `last_worker_status` (a `Literal["SUCCESS","EMPTY","ERROR","NEEDS_DOWNLOAD","BLOCKED","UNKNOWN"]` returned by every worker) rather than regex-matching prose. Static preamble + macro context block stay constant across turns so the prefix is provider-cacheable.
+3. **Workers** (one of `WORKER_NAMES` in `graph.py`) — every worker also receives the last ~3 chat turns so follow-ups disambiguate:
+   - `sql_agent` — up-to-5-step exploration. Defaults to WDI (`db_id = 2`) and skips the database-lookup step for typical macro queries; carries 3 worked few-shot examples.
    - `plotly_agent` — generates Plotly code, runs it in `python_sandbox`, returns the figure as an artifact.
    - `table_agent` — Polars transformations on prior worker output.
    - `rag_agent` — Qdrant semantic search over the news corpus.
    - `web_search` — DuckDuckGo fallback.
-   - `downloader_agent` — calls `downloader_extra` to ingest WB indicators on demand.
-   - `chat_agent` — conversational synthesis / final answer.
+   - `downloader_agent` — calls `downloader_extra` to ingest WB indicators on demand. Triggered when `sql_agent` returns `last_worker_status = NEEDS_DOWNLOAD`.
+   - `chat_agent` — conversational synthesis / general-knowledge answers.
+
+When the supervisor picks FINISH, it writes the **complete polished markdown answer** into `isolated_worker_task` and that draft is streamed to the user verbatim in ~24-char chunks (`MacroAgentGraph._stream_supervisor_draft`). There is no second synthesis LLM call — the supervisor's draft is the answer, with only a small line-level leak filter (`_sanitize_draft`) stripping any line that accidentally contains worker names / sandbox / traceback tokens.
 
 Streaming protocol is SSE on `POST /chat/stream` with `step` / `token` / `final` / `error` events; the `final` event carries the answer plus an `artifacts` dict and a `usage` block. `POST /plots/interpret` is a separate vision endpoint that reads a base64 Plotly screenshot with two modes (`no_hallucinations` strict description vs. analyst interpretation).
 
-Per-LLM-call token accounting is attached via `UsageTracker` (`agent/agent/usage.py`) on every LangChain LLM in the graph (guardrail, supervisor, each worker, final synthesis stream). Worker output schemas live in `agent/agent/schemas.py`.
+Per-LLM-call token accounting is attached via `UsageTracker` (`agent/agent/usage.py`) on every LangChain LLM in the graph (guardrail when it escalates, supervisor, each worker). Worker output schemas live in `agent/agent/schemas.py`; prompt text lives in `agent/agent/prompts.py` and follows a stable-prefix / dynamic-tail layout so provider-side automatic prefix caching can match across requests.
+
+External backend calls (sandbox, downloader_extra) use one shared `httpx.AsyncClient` from `agent.tools._get_httpx_client()` (closed in the FastAPI shutdown hook); the rendered database-schema text is `functools.lru_cache`d so it isn't re-serialised on every SQL step.
 
 ### Data ingestion
 
@@ -113,4 +118,5 @@ For incremental WB indicator additions during a live stack, the agent's `downloa
 - Charts are always **Plotly** going through the `"app"` registered template; pull colours from `core/theming` helpers rather than hard-coding.
 - Agent worker outputs are **Pydantic models** (`agent/agent/schemas.py`); structured-output LLM calls use `with_structured_output(...)`. Adding a worker means: schema in `schemas.py`, tool wrappers in `tools.py`, node + supervisor routing in `graph.py`, and the worker name in `WORKER_NAMES`.
 - Every backend HTTP endpoint should have a typed wrapper in `app/core/api_client.py` — don't bypass it from pages.
-- The agent's Postgres role is intentionally read-only (`POSTGRES_LLM_USERNAME`); don't grant it write permissions. The superuser role is only for `db_init` and operator tasks.
+- The agent's Postgres role is intentionally read-only (`POSTGRES_LLM_USERNAME`); `db_bootstrap.ensure_llm_role` grants it `USAGE` on `public` plus `SELECT` on all existing and future tables (via `ALTER DEFAULT PRIVILEGES`) — don't grant it anything more. The superuser role is only for `downloader_general` / `downloader_extra`'s ingestion writes and operator tasks.
+- DB access: the `app` keeps `connectorx` for bulk Polars reads; the `agent`'s `sql_agent` worker keeps raw `text()` because the LLM generates dynamic SQL. Everywhere else uses SQLAlchemy ORM (`select`/`delete`/`Session`) on `Mapped` models — don't sprinkle new `text()` calls.

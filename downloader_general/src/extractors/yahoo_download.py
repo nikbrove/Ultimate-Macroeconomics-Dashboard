@@ -1,7 +1,14 @@
+"""Yahoo Finance ingestion pipeline.
+
+Per category, pulls metadata (sector / industry / currency / etc.) followed by
+the full historical OHLCV series for each ticker via ``yfinance``. Per-ticker
+fetches run on a thread pool because each call is independent.
+"""
+
 import logging
 import os
 import sys
-import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
@@ -14,8 +21,8 @@ from src.core.base_downloaders import BaseYahooDownloader
 from src.utils.downloads import (
     _call_with_retries,
     _download_config,
-    _test_sql,
     _get_sql_config,
+    _test_sql,
 )
 from src.utils.schema import (
     bootstrap_schema_group,
@@ -27,9 +34,7 @@ logger = logging.getLogger(__name__)
 
 
 class YahooDownloader(BaseYahooDownloader):
-    """
-    Downloader for Yahoo Finance data
-    """
+    """Concrete Yahoo Finance downloader writing to Postgres via Polars."""
 
     SCHEMA_GROUP = "yahoo_finance"
 
@@ -39,6 +44,13 @@ class YahooDownloader(BaseYahooDownloader):
         download_config_path: str | Path,
         database_schema: Optional[Dict[str, Any]] = None,
     ):
+        """Capture configuration; Postgres URI is built in ``_initialize_connections``.
+
+        Args:
+            env_path: Path to the ``.env`` with Postgres credentials.
+            download_config_path: JSON file listing categories → tickers.
+            database_schema: Parsed schema so column lists/dtypes are typed.
+        """
         self.env_path = Path(env_path)
         self.download_config = _download_config(download_config_path)
         self.sql_uri = None
@@ -52,6 +64,9 @@ class YahooDownloader(BaseYahooDownloader):
 
         self.download_max_retries = 3
         self.download_retry_delay_seconds = 5
+        # yfinance is per-ticker synchronous; a small pool gives a clear win
+        # without overwhelming the Yahoo endpoint.
+        self.max_parallel_tickers = 6
 
     def _table_def(self, table_name: str) -> Dict[str, Any]:
         return get_table_definition(self.database_schema, self.SCHEMA_GROUP, table_name)
@@ -98,9 +113,7 @@ class YahooDownloader(BaseYahooDownloader):
         self.successful_connections = _sql_test
         return self.successful_connections
 
-    def download_historical_data(
-        self, ticker_id: str, category: str, period: str = "max"
-    ) -> None:
+    def download_historical_data(self, ticker_id: str, category: str, period: str = "max") -> None:
         logger.info(f"Starting download of historical data (ticker={ticker_id})")
 
         ticker_obj = yf.Ticker(ticker_id)
@@ -113,9 +126,7 @@ class YahooDownloader(BaseYahooDownloader):
         )
 
         if hist_df_pandas is None:
-            logger.warning(
-                f"Skipping historical data for {ticker_id}: all retries failed."
-            )
+            logger.warning(f"Skipping historical data for {ticker_id}: all retries failed.")
             return
 
         if hist_df_pandas.empty:
@@ -152,9 +163,7 @@ class YahooDownloader(BaseYahooDownloader):
 
         logger.info(f"Finished download of historical data (ticker={ticker_id})")
 
-    def download_metadata(
-        self, ticker_id: str, asset_name: str | None, category: str
-    ) -> bool:
+    def download_metadata(self, ticker_id: str, asset_name: str | None, category: str) -> bool:
         logger.info(f"Starting download of metadata (ticker={ticker_id})")
 
         ticker_obj = yf.Ticker(ticker_id)
@@ -167,9 +176,7 @@ class YahooDownloader(BaseYahooDownloader):
         )
 
         if info_dict is None:
-            logger.warning(
-                f"Skipping metadata for {ticker_id}: all retries failed."
-            )
+            logger.warning(f"Skipping metadata for {ticker_id}: all retries failed.")
             return False
 
         dataframe_dict = {
@@ -196,30 +203,51 @@ class YahooDownloader(BaseYahooDownloader):
         logger.info(f"Finished download of metadata (ticker={ticker_id})")
         return True
 
+    def _download_asset(self, ticker_id: str, asset_name: str | None, category: str) -> None:
+        """Per-ticker work unit: metadata first (FK target), then historical."""
+        metadata_ok = self.download_metadata(ticker_id, asset_name, category)
+        if not metadata_ok:
+            logger.warning(
+                f"Skipping historical data for {ticker_id}: metadata write was skipped, "
+                f"FK to yahoo_metadata.ticker would fail."
+            )
+            return
+        self.download_historical_data(ticker_id, category, period="max")
+
     def download_category(self, category: str, assets: Any) -> None:
         logger.info(f"Starting downloads for category: {category}")
 
         normalized_assets = list(self._normalize_assets(category, assets))
+        tasks = [
+            (asset.get("id"), asset.get("name"))
+            for asset in normalized_assets
+            if asset.get("id")
+        ]
+        skipped = len(normalized_assets) - len(tasks)
+        if skipped:
+            logger.warning(f"Skipping {skipped} asset(s) missing 'id' in category '{category}'")
 
-        for asset in tqdm(normalized_assets, desc=f"Downloading {category}", dynamic_ncols=True, file=sys.stdout):
-            ticker_id = asset.get("id")
-            asset_name = asset.get("name")
-
-            if not ticker_id:
-                logger.warning(f"Skipping asset missing 'id' in category '{category}'")
-                continue
-
-            metadata_ok = self.download_metadata(ticker_id, asset_name, category)
-            if not metadata_ok:
-                logger.warning(
-                    f"Skipping historical data for {ticker_id}: metadata write was skipped, "
-                    f"FK to yahoo_metadata.ticker would fail."
-                )
-                time.sleep(1)
-                continue
-            self.download_historical_data(ticker_id, category, period="max")
-
-            time.sleep(1)
+        with ThreadPoolExecutor(max_workers=self.max_parallel_tickers) as executor:
+            futures = {
+                executor.submit(self._download_asset, ticker_id, asset_name, category): ticker_id
+                for ticker_id, asset_name in tasks
+            }
+            for future in tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc=f"Downloading {category}",
+                dynamic_ncols=True,
+                file=sys.stdout,
+            ):
+                ticker_id = futures[future]
+                try:
+                    future.result()
+                except Exception:
+                    logger.exception(
+                        "Ticker download failed (ticker=%s, category=%s)",
+                        ticker_id,
+                        category,
+                    )
 
         logger.info(f"Finished downloads for category: {category}")
 

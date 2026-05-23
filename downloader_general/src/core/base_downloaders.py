@@ -1,13 +1,21 @@
+"""Abstract base classes for the three one-shot downloaders.
+
+Each concrete downloader in ``src/extractors/`` extends one of these to
+guarantee a consistent ``_initialize_connections`` / per-step / ``run``
+interface, so the entry-point in ``main.py`` can drive them uniformly.
+"""
+
 from abc import ABC, abstractmethod
-from typing import List, Dict
+from typing import Dict, List
+
 from tiktoken import Encoding
 
 
 class BaseWorldBankDownloader(ABC):
-    """Class constructor for basic `world-bank` downloader"""
+    """Abstract contract for any World Bank downloader implementation."""
 
     @abstractmethod
-    def _initialize_connections(self, host: str, port: int, db: str) -> None:
+    def _initialize_connections(self, host: str, port: int, db: str) -> bool:
         """Test whether sql and `world-bank` connections can be established"""
         pass
 
@@ -33,7 +41,7 @@ class BaseWorldBankDownloader(ABC):
 
 
 class BaseNewsDownloader(ABC):
-    """Class constructor for basic news downloader from `github`"""
+    """Abstract contract for any GitHub-sourced news downloader implementation."""
 
     @abstractmethod
     def _initialize_connections(self) -> bool:
@@ -51,7 +59,7 @@ class BaseNewsDownloader(ABC):
         pass
 
     @abstractmethod
-    def download_repository(self) -> None:
+    def download_repository(self) -> bool:
         """Fetch repository with news from `github`"""
         pass
 
@@ -66,8 +74,8 @@ class BaseNewsDownloader(ABC):
         pass
 
     @abstractmethod
-    def get_embeddings(self, text: List[str]) -> List[List[float]]:
-        """Get OpenAI embeddings for given text"""
+    def get_embeddings(self, texts: List[str]) -> List[List[float]]:
+        """Get OpenAI embeddings for given texts"""
         pass
 
     @abstractmethod
@@ -82,7 +90,7 @@ class BaseNewsDownloader(ABC):
 
 
 class BaseYahooDownloader(ABC):
-    """Class constructor for basic `yahoo-finance` downloader"""
+    """Abstract contract for any Yahoo Finance downloader implementation."""
 
     @abstractmethod
     def _initialize_connections(self, host: str, port: int, db: str) -> bool:
@@ -90,9 +98,7 @@ class BaseYahooDownloader(ABC):
         pass
 
     @abstractmethod
-    def download_historical_data(
-        self, ticker_id: str, category: str, period: str = "max"
-    ) -> None:
+    def download_historical_data(self, ticker_id: str, category: str, period: str = "max") -> None:
         """Download historical data for given ticker from `yahoo-finance`"""
         pass
 

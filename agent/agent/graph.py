@@ -1,3 +1,15 @@
+"""LangGraph multi-agent orchestration for the AI analyst.
+
+Defines one class per worker (guardrail, supervisor, sql, plotly, table, rag,
+web search, downloader, chat) plus the top-level :class:`MacroAgentGraph` that
+stitches them into a ``StateGraph``. The supervisor decides the next worker on
+each tick by emitting a :class:`SupervisorDecision`; workers contribute
+:class:`AgentState` deltas (messages, artifacts, trace lines, a coarse
+``last_worker_status`` tag) that LangGraph's channel reducers merge into the
+running state.
+"""
+
+import asyncio
 import json
 import logging
 import re
@@ -7,7 +19,11 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 
-from .prompts import GUARDRAIL_SYSTEM_PROMPT, supervisor_system_prompt
+from .prompts import (
+    GUARDRAIL_SYSTEM_PROMPT,
+    sql_agent_step_prompt,
+    supervisor_system_prompt,
+)
 from .schemas import (
     AgentState,
     ChatSynthesis,
@@ -43,21 +59,112 @@ WORKER_NAMES = [
     "chat_agent",
 ]
 
+# Maximum number of recent (user, assistant) turns surfaced to a worker for
+# follow-up disambiguation. Three turns is a good balance between context and
+# prompt size — the supervisor still has the full history.
+WORKER_HISTORY_TURNS = 3
+
+
+def _format_chat_history(messages: list, max_turns: int = WORKER_HISTORY_TURNS) -> str:
+    """Render the last ``max_turns`` messages as a compact text block.
+
+    Workers don't see ``state["messages"]`` natively; passing the trailing
+    chat turns into their prompts lets them disambiguate follow-ups like
+    "now compare with Germany" without the supervisor having to spell that
+    out in `isolated_worker_task`.
+    """
+    if not messages:
+        return ""
+    trimmed = messages[-max_turns:]
+    lines: list[str] = []
+    for msg in trimmed:
+        if isinstance(msg, HumanMessage):
+            lines.append(f"USER: {str(msg.content).strip()}")
+        elif isinstance(msg, AIMessage):
+            text = str(msg.content).strip()
+            if len(text) > 400:
+                text = text[:400] + "…"
+            lines.append(f"ASSISTANT: {text}")
+    if not lines:
+        return ""
+    return "RECENT CHAT HISTORY (for disambiguating follow-ups):\n" + "\n".join(lines) + "\n\n"
+
+
+# Regex shortcuts for the heuristic guardrail. Anything matching the first
+# pattern is auto-allowed (no LLM call); anything matching the second is
+# auto-rejected. Everything else escalates to the LLM screening step.
+_GUARDRAIL_ALLOW_SHORT_RE = re.compile(
+    r"^\s*(hi|hello|hey|good\s*(morning|afternoon|evening)|"
+    r"thanks|thank\s*you|ok|okay|cool|nice|got\s*it|"
+    r"yes|no|sure|please|continue|more)[\s\.\!\?]*$",
+    re.IGNORECASE,
+)
+_GUARDRAIL_BLOCK_RE = re.compile(
+    r"\b(porn|nsfw|naked|nude|explicit|"
+    r"kill\s+(yourself|myself)|suicide\s+(method|note|plan)|"
+    r"how\s+to\s+(make|build|synthesi[sz]e)\s+(bomb|explosive|meth|cocaine|heroin|fentanyl)|"
+    r"child\s+(porn|abuse|sexual)|cp\s+download|"
+    r"malware|ransomware|keylogger|trojan|rootkit)\b",
+    re.IGNORECASE,
+)
+# Topical keywords that mark a message as clearly in-scope for the dashboard.
+# When present, the LLM screen is skipped — saves ~30s on routine questions.
+_GUARDRAIL_IN_SCOPE_RE = re.compile(
+    r"\b(gdp|inflation|unemployment|economy|economic|economi[ce]s?|finance|"
+    r"financial|trade|export|import|currency|exchange\s*rate|interest\s*rate|"
+    r"debt|deficit|budget|fiscal|monetary|bank|central\s*bank|fed|ecb|"
+    r"stock|equit(y|ies)|market|index|indices|ticker|share|ohlc|nasdaq|s\s*&\s*p|"
+    r"company|companies|earnings|dividend|portfolio|"
+    r"world\s*bank|imf|wto|oecd|brics|eurozone|"
+    r"demograph[a-z]+|population|fertility|mortality|life\s*expectancy|"
+    r"education|literacy|enrol[lt]ment|"
+    r"health|disease|hospital|"
+    r"environment|emission|co2|climate|"
+    r"politic[a-z]*|government|election|policy|sociolog[a-z]+|"
+    r"econometric[a-z]*|regression|forecast|time\s*series|clustering|"
+    r"chart|plot|graph|visuali[sz]e|table|data\s*science|"
+    r"country|countries|nation|"
+    r"explain|what\s+is|what\s+are|how\s+does|why|definition|formula|"
+    r"compare|trend|over\s+time|since|between|"
+    r"russia|usa|united\s*states|china|germany|france|uk|india|brazil|japan|"
+    r"dashboard|agent|assistant|model|llm)\b",
+    re.IGNORECASE,
+)
+
 
 class GuardrailAgent:
-    """Screens the user's latest message before routing.
+    """Screens the user's latest message with a heuristic-first, LLM-fallback flow.
 
-    Blocks harsh language, personal attacks, sexual or otherwise
-    inappropriate content, and requests outside the dashboard's
-    macroeconomics / politics / sociology / data-science scope.
+    The fast path is a pair of regexes: short benign greetings and clearly
+    in-scope keywords auto-pass without an LLM call (saves ~30s per turn on
+    routine questions); obvious red-flag patterns auto-block. Only messages
+    that don't match either side escalate to the structured-output LLM.
     """
 
     SYSTEM_PROMPT = GUARDRAIL_SYSTEM_PROMPT
 
     def __init__(self, llm: ChatOpenAI):
+        """Bind the structured-output LLM used for the screening fallback."""
         self.llm = llm
 
+    @staticmethod
+    def _heuristic_verdict(message: str) -> str | None:
+        """Return ``"allow"``, ``"block"``, or ``None`` (escalate to LLM)."""
+        stripped = message.strip()
+        if not stripped:
+            return "allow"
+        if _GUARDRAIL_BLOCK_RE.search(stripped):
+            return "block"
+        if _GUARDRAIL_ALLOW_SHORT_RE.match(stripped):
+            return "allow"
+        # A clearly in-scope keyword plus a reasonable length → auto-allow.
+        # Short messages without in-scope keywords still escalate.
+        if len(stripped) <= 600 and _GUARDRAIL_IN_SCOPE_RE.search(stripped):
+            return "allow"
+        return None
+
     async def ainvoke(self, state: AgentState) -> dict:
+        """Screen the latest user message and emit a guardrail-decision delta."""
         last_user_msg = ""
         for msg in reversed(state.get("messages", [])):
             if isinstance(msg, HumanMessage):
@@ -69,6 +176,28 @@ class GuardrailAgent:
                 "guardrail_message": "",
                 "trace": ["guardrail: empty message — passing through"],
             }
+
+        verdict = self._heuristic_verdict(last_user_msg)
+        if verdict == "allow":
+            return {
+                "guardrail_blocked": False,
+                "guardrail_message": "",
+                "trace": ["guardrail: heuristic allow (no LLM call)"],
+            }
+        if verdict == "block":
+            logger.info("guardrail: heuristic block — pattern match")
+            refusal = (
+                "I can only help with macroeconomics, finance, politics, "
+                "sociology, data science and related dashboard topics. "
+                "Please rephrase your question."
+            )
+            return {
+                "guardrail_blocked": True,
+                "guardrail_message": refusal,
+                "trace": ["guardrail: heuristic block"],
+            }
+
+        # Ambiguous — fall back to the LLM screen.
         try:
             structured_llm = self.llm.with_structured_output(GuardrailDecision)
             decision: GuardrailDecision = await structured_llm.ainvoke(
@@ -78,7 +207,7 @@ class GuardrailAgent:
                 ]
             )
             if decision.is_inappropriate:
-                logger.info("guardrail: blocked — %s", decision.reason)
+                logger.info("guardrail: LLM blocked — %s", decision.reason)
                 refusal = (
                     decision.refusal_message.strip()
                     or "I can only help with macroeconomics, politics, "
@@ -88,12 +217,12 @@ class GuardrailAgent:
                 return {
                     "guardrail_blocked": True,
                     "guardrail_message": refusal,
-                    "trace": ["guardrail: blocked"],
+                    "trace": ["guardrail: LLM blocked"],
                 }
             return {
                 "guardrail_blocked": False,
                 "guardrail_message": "",
-                "trace": ["guardrail: passed"],
+                "trace": ["guardrail: LLM allow"],
             }
         except Exception as exc:
             logger.warning("guardrail: error – %s — passing through", exc)
@@ -105,13 +234,16 @@ class GuardrailAgent:
 
 
 class MacroSupervisorAgent:
+    """Executive supervisor: plans, picks the next worker, decides FINISH."""
+
     def __init__(self, llm: ChatOpenAI, max_retries: int = 3):
+        """Bind the structured-output LLM and per-worker retry budget."""
         self.llm = llm
         self.max_retries = max_retries
 
     @staticmethod
     def _summarize_artifacts(artifacts: dict[str, Any]) -> str:
-        """Produce a compact metadata-only summary – never include raw data rows."""
+        """Build a compact metadata-only summary; never include raw data rows."""
         if not artifacts:
             return "No artifacts stored yet."
         lines: list[str] = []
@@ -121,9 +253,7 @@ class MacroSupervisorAgent:
                 cols = value.get("columns", [])
                 lines.append(f"- {key}: {len(rows)} rows, columns={cols}")
             elif key == "latest_plotly":
-                lines.append(
-                    f"- latest_plotly: chart titled '{value.get('title', 'untitled')}'"
-                )
+                lines.append(f"- latest_plotly: chart titled '{value.get('title', 'untitled')}'")
             elif key == "latest_rag_results":
                 count = len(value) if isinstance(value, list) else "?"
                 lines.append(f"- latest_rag_results: {count} articles")
@@ -134,20 +264,41 @@ class MacroSupervisorAgent:
                 lines.append(f"- {key}: (stored)")
         return "\n".join(lines)
 
+    @staticmethod
+    def _trim_results_history(results: list[str], keep_verbatim: int = 2) -> str:
+        """Keep the most recent ``keep_verbatim`` results verbatim, summarise the rest.
+
+        Without this trim, ``worker_results`` (annotated with ``operator.add``)
+        grows unboundedly: each subsequent supervisor decision re-reads every
+        prior worker's full output, which is both slow and noisy.
+        """
+        if not results:
+            return "No workers have been called yet."
+        if len(results) <= keep_verbatim:
+            return "\n---\n".join(results)
+        older = results[:-keep_verbatim]
+        recent = results[-keep_verbatim:]
+        older_block = "\n".join(
+            f"- (earlier) {r.splitlines()[0][:200]}" for r in older
+        )
+        return (
+            f"EARLIER RESULTS (summarised — full text dropped to keep prompt small):\n"
+            f"{older_block}\n\n"
+            f"RECENT RESULTS (verbatim):\n" + "\n---\n".join(recent)
+        )
+
     def _build_system_prompt(self, state: AgentState) -> str:
+        """Compose the supervisor system prompt from the current state."""
         current_plan = state.get("current_plan") or "No plan created yet."
         last_worker = state.get("last_worker") or "None"
         retry_count = state.get("retry_count", 0)
+        last_status = state.get("last_worker_status") or "UNKNOWN"
 
-        results_history = "\n---\n".join(state.get("worker_results", []))
-        if not results_history:
-            results_history = "No workers have been called yet."
-
+        results_history = self._trim_results_history(list(state.get("worker_results", [])))
         artifacts_summary = self._summarize_artifacts(state.get("artifacts", {}))
 
         retry_status = (
-            f"Last worker: '{last_worker}', consecutive retries: "
-            f"{retry_count}/{self.max_retries}"
+            f"Last worker: '{last_worker}', consecutive retries: {retry_count}/{self.max_retries}"
         )
         if retry_count >= self.max_retries:
             retry_instruction = (
@@ -167,9 +318,11 @@ class MacroSupervisorAgent:
             artifacts_summary=artifacts_summary,
             retry_status=retry_status,
             retry_instruction=retry_instruction,
+            last_worker_status=last_status,
         )
 
     async def ainvoke(self, state: AgentState) -> dict:
+        """Pick the next worker (or FINISH) given the current state."""
         try:
             logger.info("Router: deciding next worker...")
             system_prompt = self._build_system_prompt(state)
@@ -195,8 +348,7 @@ class MacroSupervisorAgent:
                 )
                 return {
                     "current_plan": (
-                        decision.updated_plan
-                        + f"\n[System: max retries hit for {last_worker}]"
+                        decision.updated_plan + f"\n[System: max retries hit for {last_worker}]"
                     ),
                     "next_worker": "chat_agent",
                     "isolated_worker_task": (
@@ -205,9 +357,7 @@ class MacroSupervisorAgent:
                     ),
                     "last_worker": "chat_agent",
                     "retry_count": 0,
-                    "trace": [
-                        f"Router: max retries for {last_worker}, falling back to chat_agent"
-                    ],
+                    "trace": [f"Router: max retries for {last_worker}, falling back to chat_agent"],
                 }
 
             logger.info("Router: selected '%s'", decision.next_worker)
@@ -232,119 +382,35 @@ class MacroSupervisorAgent:
 
 
 class SQLAgent:
+    """Worker that issues up to ``MAX_SQL_STEPS`` read-only SELECTs against Postgres."""
+
     MAX_SQL_STEPS = 5
 
     def __init__(self, llm: ChatOpenAI):
+        """Bind the structured-output LLM for SQL generation."""
         self.llm = llm
 
-    def _build_step_prompt(
-        self,
-        task: str,
-        schema_text: str,
-        previous_steps: list[dict],
-    ) -> str:
-        history_block = ""
-        if previous_steps:
-            parts: list[str] = []
-            for i, step in enumerate(previous_steps, 1):
-                rows = step["result"].get("rows", [])
-                sample = rows[:5]
-                parts.append(
-                    f"--- Step {i} ---\n"
-                    f"Thought: {step['thought']}\n"
-                    f"Query: {step['query']}\n"
-                    f"Rows returned: {step['result'].get('row_count', 0)}\n"
-                    f"Columns: {step['result'].get('columns', [])}\n"
-                    f"Sample rows (first 5): {json.dumps(sample, default=str)[:1500]}"
-                )
-            history_block = "\n\nPREVIOUS EXPLORATION STEPS:\n" + "\n\n".join(parts)
-
-        return f"""You are a PostgreSQL expert for a macroeconomic database.
-
-DATABASE SCHEMA:
-{schema_text}
-
-THIS DATABASE COVERS TWO INDEPENDENT DOMAINS — pick the right one FIRST:
-  * WORLD BANK macro indicators → tables `databases`, `database_indicators`,
-    `indicators`, `metadata`, `countries`. Use the 3-step plan below.
-  * YAHOO FINANCE market data → tables `yahoo_metadata` and
-    `yahoo_historical_prices`. Use the 1–2 step plan below. NEVER touch
-    the World Bank tables for stock/index/ticker requests.
-
-Inspect the user task; if it mentions tickers, stocks, equities, indices,
-companies, OHLC/closing prices, market cap, "S&P", "NASDAQ", "Apple",
-"^GSPC", "AAPL" etc. → YAHOO. Otherwise (GDP, inflation, unemployment,
-demography, health, education, environment, governance) → WORLD BANK.
-
-==================================================================
-PLAN A — WORLD BANK (mandatory step order, do NOT skip or guess IDs):
-
-Step 1 — IDENTIFY THE DATABASE:
-  Query the `databases` table to find which database is relevant.
-  Example: SELECT id, name, description FROM databases
-           WHERE name ILIKE '%development%' OR description ILIKE '%gdp%';
-
-Step 2 — FIND THE INDICATOR:
-  Query `database_indicators` filtered by `database_id` from Step 1.
-  Use ILIKE/regexp on `description` to narrow thousands of rows.
-  Example: SELECT id, description FROM database_indicators
-           WHERE database_id = 2 AND description ~* 'gdp.*per capita';
-
-Step 3 — FETCH THE DATA (final, is_final_step=true):
-  SELECT i.economy, c.value AS country_name, i.year, i.value,
-         m.indicator_name, m.units
-  FROM indicators i
-  JOIN metadata m ON i.indicator_id = m.indicator_id AND i.db_id = m.db_id
-  LEFT JOIN countries c ON i.economy = c.id
-  WHERE i.indicator_id = 'NY.GDP.PCAP.CD' AND i.db_id = 2
-  ORDER BY i.year;
-
-Step 4 (optional) — COUNTRY METADATA:
-  SELECT id, value, "region.value", "incomeLevel.value" FROM countries
-  WHERE aggregate = false;
-
-==================================================================
-PLAN B — YAHOO FINANCE (1–2 steps):
-
-Step 1 — RESOLVE THE TICKER (skip if the user already gave one):
-  Query `yahoo_metadata` to find the right ticker by asset_name,
-  short_name, sector, industry, or category ('Indices' / 'Companies').
-  Example:
-    SELECT ticker, asset_name, short_name, sector, industry, currency
-    FROM yahoo_metadata
-    WHERE short_name ILIKE '%apple%' OR asset_name ILIKE '%apple%';
-  If zero rows: tell the router the asset is not tracked. Do NOT invent a
-  ticker. (downloader_agent does NOT support Yahoo Finance.)
-
-Step 2 — FETCH PRICE HISTORY (final, is_final_step=true):
-  SELECT date, open, high, low, close, volume, ticker, category
-  FROM yahoo_historical_prices
-  WHERE ticker = 'AAPL'
-    AND date >= '2020-01-01'
-  ORDER BY date;
-  Join with yahoo_metadata only if the answer needs descriptive fields
-  (sector, currency, exchange).
-
-==================================================================
-RULES (apply to BOTH plans):
-- Only SELECT statements.
-- NEVER invent or guess World Bank indicator IDs or Yahoo tickers — look
-  them up first.
-- The 'economy' column in `indicators` holds 3-letter ISO country codes.
-- Use double quotes for identifiers with special characters
-  (e.g. "region.value").
-- Limit results to 500 rows unless the task explicitly asks for more.
-- For exploration steps (World Bank Step 1–2 / Yahoo Step 1),
-  is_final_step = false. For the final data retrieval, is_final_step = true.
-{history_block}
-
-USER TASK:
-{task}
-
-Based on the previous steps (if any), generate the NEXT query in the sequence."""
+    @staticmethod
+    def _build_history_block(previous_steps: list[dict]) -> str:
+        if not previous_steps:
+            return ""
+        parts: list[str] = []
+        for i, step in enumerate(previous_steps, 1):
+            rows = step["result"].get("rows", [])
+            sample = rows[:5]
+            parts.append(
+                f"--- Step {i} ---\n"
+                f"Thought: {step['thought']}\n"
+                f"Query: {step['query']}\n"
+                f"Rows returned: {step['result'].get('row_count', 0)}\n"
+                f"Columns: {step['result'].get('columns', [])}\n"
+                f"Sample rows (first 5): {json.dumps(sample, default=str)[:1500]}"
+            )
+        return "\nPREVIOUS EXPLORATION STEPS:\n" + "\n\n".join(parts) + "\n"
 
     async def ainvoke(self, state: AgentState) -> dict:
         task = state["isolated_worker_task"]
+        chat_history_block = _format_chat_history(list(state.get("messages", [])))
         logger.info("sql_agent: starting multi-step exploration")
         try:
             schema_text = get_database_schema_text()
@@ -354,10 +420,13 @@ Based on the previous steps (if any), generate the NEXT query in the sequence.""
             final_result = None
 
             for step_num in range(1, self.MAX_SQL_STEPS + 1):
-                prompt = self._build_step_prompt(task, schema_text, previous_steps)
-                gen: SQLGeneration = await structured_llm.ainvoke(
-                    [SystemMessage(content=prompt)]
+                prompt = sql_agent_step_prompt(
+                    schema_text=schema_text,
+                    chat_history_block=chat_history_block,
+                    task=task,
+                    history_block=self._build_history_block(previous_steps),
                 )
+                gen: SQLGeneration = await structured_llm.ainvoke([SystemMessage(content=prompt)])
 
                 result = await run_sql_query(gen.sql_query)
 
@@ -407,10 +476,7 @@ Based on the previous steps (if any), generate the NEXT query in the sequence.""
                     info = err if err else f"{s['result'].get('row_count', 0)} rows"
                     step_lines.append(f"  Step {i + 1}: {s['query'][:120]} -> {info}")
                     query_lower = s["query"].lower()
-                    if (
-                        "database_indicators" in query_lower
-                        and s["result"].get("row_count", 0) > 0
-                    ):
+                    if "database_indicators" in query_lower and s["result"].get("row_count", 0) > 0:
                         indicator_match_step = s
                 steps_summary = "\n".join(step_lines)
 
@@ -421,7 +487,7 @@ Based on the previous steps (if any), generate the NEXT query in the sequence.""
                         indicator_match_step["query"],
                         re.IGNORECASE,
                     )
-                    db_id_value = db_id_match.group(1) if db_id_match else "(unknown)"
+                    db_id_value = db_id_match.group(1) if db_id_match else "2"
                     first_indicator_id = (
                         candidate_rows[0].get("id") if candidate_rows else "(unknown)"
                     )
@@ -430,12 +496,10 @@ Based on the previous steps (if any), generate the NEXT query in the sequence.""
                         f"description={(row.get('description') or '')[:140]}"
                         for row in candidate_rows
                     ]
-                    candidates_block = (
-                        "\n".join(candidate_lines) or "    (no candidates extracted)"
-                    )
+                    candidates_block = "\n".join(candidate_lines) or "    (no candidates extracted)"
                     return {
                         "worker_results": [
-                            f"SQL_AGENT INDICATOR_NOT_DOWNLOADED: indicator found in "
+                            f"SQL_AGENT NEEDS_DOWNLOAD: indicator found in "
                             f"database_indicators (db_id={db_id_value}) but the "
                             f"`indicators` table has no rows for it yet — it has "
                             f"not been downloaded.\n"
@@ -448,8 +512,9 @@ Based on the previous steps (if any), generate the NEXT query in the sequence.""
                             f"matches the user's request, then retry sql_agent.\n"
                             f"Steps taken:\n{steps_summary}"
                         ],
+                        "last_worker_status": "NEEDS_DOWNLOAD",
                         "trace": [
-                            f"sql_agent: indicator found but not downloaded "
+                            f"sql_agent: NEEDS_DOWNLOAD "
                             f"(candidate={first_indicator_id}, db={db_id_value}, "
                             f"{len(previous_steps)} steps)"
                         ],
@@ -457,10 +522,11 @@ Based on the previous steps (if any), generate the NEXT query in the sequence.""
 
                 return {
                     "worker_results": [
-                        f"SQL_AGENT ERROR: Could not retrieve data after "
+                        f"SQL_AGENT EMPTY: Could not retrieve data after "
                         f"{len(previous_steps)} steps.\nSteps taken:\n{steps_summary}"
                     ],
-                    "trace": [f"sql_agent: failed after {len(previous_steps)} steps"],
+                    "last_worker_status": "EMPTY",
+                    "trace": [f"sql_agent: empty after {len(previous_steps)} steps"],
                 }
 
             truncated_note = " [TRUNCATED]" if final_result.get("truncated") else ""
@@ -480,6 +546,7 @@ Based on the previous steps (if any), generate the NEXT query in the sequence.""
                     f"Columns: {final_result['columns']}.{truncated_note}"
                 ],
                 "artifacts": {"latest_data": final_result},
+                "last_worker_status": "SUCCESS",
                 "trace": [
                     f"sql_agent: {steps_trace} → "
                     f"final {final_result['row_count']} rows, "
@@ -490,18 +557,32 @@ Based on the previous steps (if any), generate the NEXT query in the sequence.""
             logger.exception("sql_agent: error")
             return {
                 "worker_results": [f"SQL_AGENT ERROR: {exc}"],
+                "last_worker_status": "ERROR",
                 "trace": [f"sql_agent: exception – {exc}"],
             }
 
 
 class PlotlyAgent:
-    def __init__(self, llm: ChatOpenAI):
-        self.llm = llm
+    """Worker that generates Plotly code and runs it in the python sandbox."""
 
     MAX_FIX_ATTEMPTS = 3
 
-    @staticmethod
+    PREAMBLE = """You are a Plotly visualisation expert.
+
+RULES:
+- Input data is available as `data` (list of dicts).
+- Create a clear, informative chart. Use appropriate chart type.
+- Assign the final figure to `fig`. Do NOT call fig.show().
+- Use ONLY `plotly.graph_objects` (imported as `go`). Do NOT import or use `plotly.express`.
+- Handle possible None/null values gracefully."""
+
+    def __init__(self, llm: ChatOpenAI):
+        """Bind the structured-output LLM for code generation."""
+        self.llm = llm
+
+    @classmethod
     def _build_plotly_prompt(
+        cls,
         task: str,
         columns: list,
         rows_count: int,
@@ -522,19 +603,15 @@ class PlotlyAgent:
                 + "\n\n".join(parts)
             )
 
-        return f"""You are a Plotly visualisation expert.
+        return f"""{cls.PREAMBLE}
+
+================================================================
+RUNTIME STATE for this chart (changes per call):
 
 DATA SCHEMA:
 - Columns: {columns}
 - Total rows: {rows_count}
 - Sample (first 3 rows): {json.dumps(sample, default=str)[:1500]}
-
-RULES:
-- Input data is available as `data` (list of dicts, {rows_count} rows).
-- Create a clear, informative chart. Use appropriate chart type.
-- Assign the final figure to `fig`. Do NOT call fig.show().
-- Import any required plotly modules at the top.
-- Handle possible None/null values gracefully.
 {history_block}
 
 YOUR TASK:
@@ -549,9 +626,8 @@ YOUR TASK:
             rows = data.get("rows", data.get("records", []))
             if not rows:
                 return {
-                    "worker_results": [
-                        "PLOTLY_AGENT ERROR: No data in artifacts to visualise."
-                    ],
+                    "worker_results": ["PLOTLY_AGENT BLOCKED: No data in artifacts to visualise."],
+                    "last_worker_status": "BLOCKED",
                     "trace": ["plotly_agent: no data available"],
                 }
 
@@ -579,8 +655,7 @@ YOUR TASK:
 
                 sandbox_code = (
                     "import json, base64\n"
-                    "import plotly.graph_objects as go\n"
-                    "import plotly.express as px\n\n"
+                    "import plotly.graph_objects as go\n\n"
                     f'data = json.loads(base64.b64decode("{data_b64}").decode())\n\n'
                     f"{gen.plotly_code}\n\n"
                     "_figure_json = fig.to_json()\n"
@@ -635,9 +710,9 @@ YOUR TASK:
                             "title": gen.title,
                         }
                     },
+                    "last_worker_status": "SUCCESS",
                     "trace": [
-                        f"plotly_agent: chart '{gen.title}' generated "
-                        f"(attempt {attempt_num})"
+                        f"plotly_agent: chart '{gen.title}' generated (attempt {attempt_num})"
                     ],
                 }
 
@@ -647,6 +722,7 @@ YOUR TASK:
                     f"attempts failed.\nLast issue: "
                     f"{last_issue[:1500]}\nLast code:\n{last_code}"
                 ],
+                "last_worker_status": "ERROR",
                 "trace": [
                     f"plotly_agent: failed after {self.MAX_FIX_ATTEMPTS} "
                     f"attempts – {last_issue[:120]}"
@@ -656,18 +732,31 @@ YOUR TASK:
             logger.exception("plotly_agent: error")
             return {
                 "worker_results": [f"PLOTLY_AGENT ERROR: {exc}"],
+                "last_worker_status": "ERROR",
                 "trace": [f"plotly_agent: exception – {exc}"],
             }
 
 
 class TableAgent:
+    """Worker that transforms tabular data via LLM-generated Polars snippets."""
+
     MAX_FIX_ATTEMPTS = 3
 
+    PREAMBLE = """You are a senior data engineer using the Python `polars` library.
+
+RULES:
+- Write clean, idiomatic Polars code (pl.col, select, with_columns, group_by, agg…).
+- `import polars as pl` and the DataFrame `df` already exist – do NOT recreate them.
+- Assign the final transformed DataFrame to `result_df`.
+- Do NOT use pandas."""
+
     def __init__(self, llm: ChatOpenAI):
+        """Bind the structured-output LLM for Polars code generation."""
         self.llm = llm
 
-    @staticmethod
+    @classmethod
     def _build_polars_prompt(
+        cls,
         task: str,
         schema_lines: str,
         columns: list,
@@ -688,19 +777,16 @@ class TableAgent:
                 + "\n\n".join(parts)
             )
 
-        return f"""You are a senior data engineer using the Python `polars` library.
+        return f"""{cls.PREAMBLE}
+
+================================================================
+RUNTIME STATE for this transform (changes per call):
 
 INPUT DATA SCHEMA (variable: `df`):
 {schema_lines}
 
 Columns: {columns}
 Total rows: {rows_count}
-
-RULES:
-- Write clean, idiomatic Polars code (pl.col, select, with_columns, group_by, agg…).
-- `import polars as pl` and the DataFrame `df` already exist – do NOT recreate them.
-- Assign the final transformed DataFrame to `result_df`.
-- Do NOT use pandas.
 {history_block}
 
 YOUR TASK:
@@ -715,17 +801,14 @@ YOUR TASK:
             rows = data.get("rows", data.get("records", []))
             if not rows:
                 return {
-                    "worker_results": [
-                        "TABLE_AGENT ERROR: No input data in artifacts."
-                    ],
+                    "worker_results": ["TABLE_AGENT BLOCKED: No input data in artifacts."],
+                    "last_worker_status": "BLOCKED",
                     "trace": ["table_agent: no data available"],
                 }
 
             columns = data.get("columns", list(rows[0].keys()))
             sample_row = rows[0]
-            schema_lines = "\n".join(
-                f"  - {k}: {type(v).__name__}" for k, v in sample_row.items()
-            )
+            schema_lines = "\n".join(f"  - {k}: {type(v).__name__}" for k, v in sample_row.items())
             data_b64 = encode_data_for_sandbox(rows)
             structured_llm = self.llm.with_structured_output(PolarsCodeGeneration)
 
@@ -780,6 +863,7 @@ YOUR TASK:
                                 "query": f"[polars transformation] {task[:100]}",
                             }
                         },
+                        "last_worker_status": "SUCCESS",
                         "trace": [
                             f"table_agent: {parsed['row_count']} rows, "
                             f"cols={parsed['columns']} (attempt {attempt_num})"
@@ -800,6 +884,7 @@ YOUR TASK:
                     f"attempts failed.\nLast stderr: {last_error[:1500]}\n"
                     f"Last code:\n{last_code}"
                 ],
+                "last_worker_status": "ERROR",
                 "trace": [
                     f"table_agent: failed after {self.MAX_FIX_ATTEMPTS} "
                     f"attempts – {last_error[:120]}"
@@ -809,26 +894,35 @@ YOUR TASK:
             logger.exception("table_agent: error")
             return {
                 "worker_results": [f"TABLE_AGENT ERROR: {exc}"],
+                "last_worker_status": "ERROR",
                 "trace": [f"table_agent: exception – {exc}"],
             }
 
 
 class RAGAgent:
+    """Worker that searches the Qdrant news corpus for the supervisor's question."""
+
+    PREAMBLE = """You are a news-retrieval specialist.
+You plan semantic search queries against a Qdrant vector database of news articles."""
+
     def __init__(self, llm: ChatOpenAI):
+        """Bind the structured-output LLM for search-plan generation."""
         self.llm = llm
 
     async def ainvoke(self, state: AgentState) -> dict:
         task = state["isolated_worker_task"]
+        chat_history_block = _format_chat_history(list(state.get("messages", [])))
         logger.info("rag_agent: starting news search")
         try:
             topics = get_news_topics()
-            system_prompt = f"""You are a news-retrieval specialist.
-You plan semantic search queries against a Qdrant vector database of news articles.
+            system_prompt = f"""{self.PREAMBLE}
 
 AVAILABLE TOPICS: {topics}
 AVAILABLE SENTIMENTS: positive, negative
 
-YOUR TASK:
+================================================================
+RUNTIME STATE (changes per call):
+{chat_history_block}YOUR TASK:
 {task}"""
 
             structured_llm = self.llm.with_structured_output(RAGSearchPlan)
@@ -846,12 +940,12 @@ YOUR TASK:
 
             articles = result.get("articles", [])
             if not articles:
-                msg = (
-                    result.get("error") or result.get("message") or "No articles found."
-                )
+                msg = result.get("error") or result.get("message") or "No articles found."
                 logger.info("rag_agent: %s", msg)
+                status = "ERROR" if result.get("error") else "EMPTY"
                 return {
-                    "worker_results": [f"RAG_AGENT: {msg}"],
+                    "worker_results": [f"RAG_AGENT {status}: {msg}"],
+                    "last_worker_status": status,
                     "trace": [f"rag_agent: {msg}"],
                 }
 
@@ -874,31 +968,38 @@ YOUR TASK:
                     + "\n---\n".join(summaries)
                 ],
                 "artifacts": {"latest_rag_results": articles},
-                "trace": [
-                    f"rag_agent: {len(articles)} articles for "
-                    f"'{plan.search_query[:80]}'"
-                ],
+                "last_worker_status": "SUCCESS",
+                "trace": [f"rag_agent: {len(articles)} articles for '{plan.search_query[:80]}'"],
             }
         except Exception as exc:
             logger.exception("rag_agent: error")
             return {
                 "worker_results": [f"RAG_AGENT ERROR: {exc}"],
+                "last_worker_status": "ERROR",
                 "trace": [f"rag_agent: exception – {exc}"],
             }
 
 
 class WebSearchAgent:
+    """DuckDuckGo fallback worker for questions outside the RAG / SQL surfaces."""
+
+    PREAMBLE = """You are a web-research specialist.
+Generate 1-3 focused search queries to find information on the internet."""
+
     def __init__(self, llm: ChatOpenAI):
+        """Bind the structured-output LLM for search-query generation."""
         self.llm = llm
 
     async def ainvoke(self, state: AgentState) -> dict:
         task = state["isolated_worker_task"]
+        chat_history_block = _format_chat_history(list(state.get("messages", [])))
         logger.info("web_search: starting internet search")
         try:
-            system_prompt = f"""You are a web-research specialist.
-Generate 1-3 focused search queries to find information on the internet.
+            system_prompt = f"""{self.PREAMBLE}
 
-YOUR TASK:
+================================================================
+RUNTIME STATE (changes per call):
+{chat_history_block}YOUR TASK:
 {task}"""
 
             structured_llm = self.llm.with_structured_output(WebSearchPlan)
@@ -912,8 +1013,10 @@ YOUR TASK:
             hits = result.get("results", [])
             if not hits:
                 error_msg = result.get("error", "No results found.")
+                status = "ERROR" if result.get("error") else "EMPTY"
                 return {
-                    "worker_results": [f"WEB_SEARCH: {error_msg}"],
+                    "worker_results": [f"WEB_SEARCH {status}: {error_msg}"],
+                    "last_worker_status": status,
                     "trace": [f"web_search: {error_msg}"],
                 }
 
@@ -928,26 +1031,20 @@ YOUR TASK:
                     f"WEB_SEARCH SUCCESS: {len(hits)} results.\n" + "\n".join(summaries)
                 ],
                 "artifacts": {"latest_web_results": hits},
+                "last_worker_status": "SUCCESS",
                 "trace": [f"web_search: {len(hits)} results for {plan.search_queries}"],
             }
         except Exception as exc:
             logger.exception("web_search: error")
             return {
                 "worker_results": [f"WEB_SEARCH ERROR: {exc}"],
+                "last_worker_status": "ERROR",
                 "trace": [f"web_search: exception – {exc}"],
             }
 
 
 class DownloaderAgent:
-    """Downloads a World Bank indicator's full table via the downloader_extra service.
-
-    The supervisor is expected to have already used sql_agent to discover
-    the exact `indicator_id` and `db_id` (via the `databases` →
-    `database_indicators` exploration) and to have included those values
-    verbatim in the worker task. This agent extracts them and calls
-    `/ingest`, which fetches every (economy, year) row for that indicator
-    from the World Bank API and persists them to the `indicators` table.
-    """
+    """Worker that on-demand-ingests a single World Bank indicator into Postgres."""
 
     EXTRACT_SYSTEM_PROMPT = (
         "You extract the exact World Bank `indicator_id` (string, e.g. "
@@ -961,9 +1058,11 @@ class DownloaderAgent:
     )
 
     def __init__(self, llm: ChatOpenAI):
+        """Bind the structured-output LLM that extracts the indicator id + db id."""
         self.llm = llm
 
     async def ainvoke(self, state: AgentState) -> dict:
+        """Extract ``(indicator_id, db_id)`` and call ``downloader_extra/ingest``."""
         task = state["isolated_worker_task"]
         logger.info("downloader_agent: extracting indicator id from task")
         try:
@@ -989,9 +1088,9 @@ class DownloaderAgent:
                         f"DOWNLOADER_AGENT ERROR: {error} "
                         f"(indicator={plan.indicator_id}, db={plan.db_id})"
                     ],
+                    "last_worker_status": "ERROR",
                     "trace": [
-                        f"downloader_agent: failed – {plan.indicator_id}/"
-                        f"{plan.db_id} – {error}"
+                        f"downloader_agent: failed – {plan.indicator_id}/{plan.db_id} – {error}"
                     ],
                 }
 
@@ -1005,6 +1104,7 @@ class DownloaderAgent:
                     f"this indicator is now stored in the `indicators` table — "
                     f"route back to sql_agent to fetch it."
                 ],
+                "last_worker_status": "SUCCESS",
                 "trace": [
                     f"downloader_agent: {plan.indicator_id}/{plan.db_id} – "
                     f"{rows_inserted} rows, status={status}"
@@ -1014,53 +1114,67 @@ class DownloaderAgent:
             logger.exception("downloader_agent: error")
             return {
                 "worker_results": [f"DOWNLOADER_AGENT ERROR: {exc}"],
+                "last_worker_status": "ERROR",
                 "trace": [f"downloader_agent: exception – {exc}"],
             }
 
 
 class ChatAgent:
+    """Worker that turns accumulated worker results into a final markdown answer."""
+
+    PREAMBLE = (
+        "You are a helpful macroeconomic analyst assistant. "
+        "Synthesise information, explain economic concepts, or provide "
+        "conversational responses. Use markdown formatting. "
+        "Be concise but thorough. "
+        "For mathematical expressions, use Streamlit-compatible "
+        "markdown math syntax: inline as `$expr$` and block as "
+        "`$$expr$$`. Never use `\\(...\\)` or `\\[...\\]` delimiters — "
+        "they will not render in the chat UI."
+    )
+
     def __init__(self, llm: ChatOpenAI):
+        """Bind the structured-output LLM for the final synthesis."""
         self.llm = llm
 
     async def ainvoke(self, state: AgentState) -> dict:
         task = state["isolated_worker_task"]
+        chat_history_block = _format_chat_history(list(state.get("messages", [])))
         logger.info("chat_agent: synthesising response")
         try:
-            system_prompt = (
-                "You are a helpful macroeconomic analyst assistant. "
-                "Synthesise information, explain economic concepts, or provide "
-                "conversational responses. Use markdown formatting. "
-                "Be concise but thorough. "
-                "For mathematical expressions, use Streamlit-compatible "
-                "markdown math syntax: inline as `$expr$` and block as "
-                "`$$expr$$`. Never use `\\(...\\)` or `\\[...\\]` delimiters — "
-                "they will not render in the chat UI."
-            )
+            user_prompt = f"{chat_history_block}USER TASK (from the supervisor):\n{task}"
 
             structured_llm = self.llm.with_structured_output(ChatSynthesis)
             synthesis: ChatSynthesis = await structured_llm.ainvoke(
                 [
-                    SystemMessage(content=system_prompt),
-                    HumanMessage(content=task),
+                    SystemMessage(content=self.PREAMBLE),
+                    HumanMessage(content=user_prompt),
                 ]
             )
 
             return {
                 "worker_results": [f"CHAT_AGENT: {synthesis.response}"],
-                "trace": [
-                    f"chat_agent: synthesised response ({len(synthesis.response)} chars)"
-                ],
+                "last_worker_status": "SUCCESS",
+                "trace": [f"chat_agent: synthesised response ({len(synthesis.response)} chars)"],
             }
         except Exception as exc:
             logger.exception("chat_agent: error")
             return {
                 "worker_results": [f"CHAT_AGENT ERROR: {exc}"],
+                "last_worker_status": "ERROR",
                 "trace": [f"chat_agent: exception – {exc}"],
             }
 
 
 class MacroAgentGraph:
     """Builds and wraps the LangGraph multi-agent graph."""
+
+    # How big each streamed chunk of the supervisor draft is, and the delay
+    # between chunks. The dashboard chat UI just appends each delta, so we
+    # cut the draft into small bursts to keep the streaming feel without
+    # paying for another LLM call.
+    DRAFT_STREAM_CHUNK_CHARS = 24
+    DRAFT_STREAM_DELAY_SECONDS = 0.01
 
     def __init__(
         self,
@@ -1070,6 +1184,7 @@ class MacroAgentGraph:
         max_retries: int = 3,
         recursion_limit: int = 30,
     ):
+        """Construct one ``ChatOpenAI`` instance and assemble the StateGraph."""
         self.llm = ChatOpenAI(
             base_url=base_url,
             model=model_name,
@@ -1094,6 +1209,7 @@ class MacroAgentGraph:
         self.graph = self._build_graph()
 
     def _build_graph(self):
+        """Wire every worker into a ``StateGraph`` with conditional edges."""
         builder = StateGraph(AgentState)
 
         builder.add_node("guardrail", self.guardrail.ainvoke)
@@ -1130,6 +1246,7 @@ class MacroAgentGraph:
         message: str,
         chat_history: list[dict],
     ) -> dict:
+        """Convert raw chat history + the current message into a LangGraph state."""
         messages: list = []
         for msg in chat_history:
             role = msg.get("role", "user")
@@ -1148,112 +1265,55 @@ class MacroAgentGraph:
             "isolated_worker_task": "",
             "artifacts": {},
             "last_worker": "",
+            "last_worker_status": "UNKNOWN",
             "retry_count": 0,
             "trace": [],
             "guardrail_blocked": False,
             "guardrail_message": "",
         }
 
-    FINAL_SYNTHESIS_SYSTEM_PROMPT = (
-        "You are the streaming output channel of the macroeconomic dashboard's "
-        "router agent. The router has already composed the final answer in the "
-        "SUPERVISOR DRAFT. Your job is to deliver that draft to the user, "
-        "preserving its content as faithfully as possible.\n\n"
-        "STRICT RULES:\n"
-        "- Output the supervisor draft verbatim whenever it is well-formed. "
-        "  Only adjust if the draft has obvious markdown/formatting glitches "
-        "  or accidentally exposes implementation details (worker names, "
-        "  retries, SQL, sandbox, tracebacks). In that case, fix the leak in "
-        "  place but keep every fact, number, citation and URL intact.\n"
-        "- Never invent new facts, numbers or sources that are not in the "
-        "  draft or worker results.\n"
-        "- Do NOT embed the full data table in your reply. The dashboard "
-        "  renders it separately in an expander. A short markdown table of "
-        "  2–4 hand-picked headline figures is acceptable.\n"
-        "- When a chart artifact exists, the dashboard ALREADY renders the "
-        "  rendered Plotly chart in the chat above your answer. Refer to it "
-        "  as 'the chart above' and only describe what the user can see. "
-        "  NEVER include Plotly code, JSON figure specs, fenced ```python``` "
-        "  code blocks, axis-by-axis listings, or any technical chart "
-        "  implementation details in your reply.\n"
-        "- For mathematical expressions, use Streamlit-compatible markdown "
-        "  math: inline as `$expr$` and block as `$$expr$$`. Never use "
-        "  `\\(...\\)` or `\\[...\\]` — they will not render in the chat UI.\n"
-        "- When citing news articles, keep their source URLs as markdown links.\n"
-        "- Never apologise for technical issues. If the data was unavailable, "
-        "  state it politely without revealing the internal failure mode."
+    _LEAK_PATTERN = re.compile(
+        r"(SQL_AGENT|PLOTLY_AGENT|TABLE_AGENT|RAG_AGENT|WEB_SEARCH|"
+        r"DOWNLOADER_AGENT|CHAT_AGENT|sql_agent|plotly_agent|table_agent|"
+        r"rag_agent|web_search|downloader_agent|chat_agent|"
+        r"NEEDS_DOWNLOAD|last_worker_status|isolated_worker_task|"
+        r"sandbox|traceback|Traceback)",
     )
 
-    @staticmethod
-    def _format_worker_results(state: dict) -> str:
-        results = state.get("worker_results") or []
-        if not results:
-            return "(no worker results)"
-        return "\n---\n".join(str(r) for r in results)
+    @classmethod
+    def _sanitize_draft(cls, draft: str) -> str:
+        """Drop obvious internal-detail leaks from the supervisor's FINISH draft.
 
-    @staticmethod
-    def _last_user_message(state: dict) -> str:
-        for msg in reversed(state.get("messages", [])):
-            if isinstance(msg, HumanMessage):
-                return str(msg.content)
-        return ""
-
-    async def _stream_final_synthesis(
-        self,
-        state: dict,
-        supervisor_draft: str,
-        config: dict | None = None,
-    ):
-        """Re-emit the final answer as a token stream.
-
-        Uses a separate, non-structured streaming call seeded with the
-        supervisor's drafted answer plus the worker context, so the user
-        sees tokens incrementally instead of one atomic blob.
+        The supervisor is told never to leak worker names / retry / SQL /
+        sandbox details, but smaller models occasionally slip. This is a
+        last-mile guard: any line containing a leak token is dropped. We do
+        NOT rewrite the prose — we only strip leaking lines and trim.
         """
-        artifacts = state.get("artifacts", {}) or {}
-        has_plot = isinstance(artifacts.get("latest_plotly"), dict) and bool(
-            artifacts["latest_plotly"].get("figure_json")
-        )
-        latest_data = artifacts.get("latest_data") or artifacts.get("latest_table")
-        has_data = (
-            isinstance(latest_data, dict)
-            and bool(latest_data.get("rows") or latest_data.get("records"))
-        )
+        if not draft:
+            return draft
+        kept_lines: list[str] = []
+        for line in draft.splitlines():
+            if cls._LEAK_PATTERN.search(line):
+                continue
+            kept_lines.append(line)
+        cleaned = "\n".join(kept_lines).strip()
+        return cleaned or draft.strip()
 
-        artifact_hints: list[str] = []
-        if has_plot:
-            artifact_hints.append("A plot has been rendered above your answer.")
-        if has_data:
-            artifact_hints.append(
-                "A data table is shown below your answer in an expander."
-            )
-        artifact_block = (
-            "\n".join(f"- {h}" for h in artifact_hints) or "- No artifacts."
-        )
+    async def _stream_supervisor_draft(self, draft: str):
+        """Chunk-stream the supervisor's drafted FINISH answer to the user.
 
-        user_question = self._last_user_message(state)
-        worker_block = self._format_worker_results(state)
-        draft_block = supervisor_draft.strip() or "(no draft)"
-
-        user_prompt = (
-            f"USER QUESTION:\n{user_question}\n\n"
-            f"WORKER RESULTS (internal — do NOT quote verbatim):\n{worker_block}\n\n"
-            f"ARTIFACTS AVAILABLE TO THE UI:\n{artifact_block}\n\n"
-            f"SUPERVISOR DRAFT (deliver this to the user; preserve verbatim "
-            f"unless it leaks internals or is malformed):\n{draft_block}\n\n"
-            "Stream the final answer for the user now."
-        )
-
-        async for chunk in self.llm.astream(
-            [
-                SystemMessage(content=self.FINAL_SYNTHESIS_SYSTEM_PROMPT),
-                HumanMessage(content=user_prompt),
-            ],
-            config=config or {},
-        ):
-            delta = getattr(chunk, "content", "") or ""
-            if delta:
-                yield delta
+        Replaces the old ``_stream_final_synthesis`` LLM call. The supervisor
+        already wrote the polished markdown answer in ``isolated_worker_task``
+        when it picked FINISH, so we just emit it in small bursts to preserve
+        the streaming-chat feel — no additional model call, no risk of the
+        synthesis step altering numbers.
+        """
+        if not draft:
+            return
+        for i in range(0, len(draft), self.DRAFT_STREAM_CHUNK_CHARS):
+            yield draft[i : i + self.DRAFT_STREAM_CHUNK_CHARS]
+            if self.DRAFT_STREAM_DELAY_SECONDS > 0:
+                await asyncio.sleep(self.DRAFT_STREAM_DELAY_SECONDS)
 
     async def astream_events(
         self,
@@ -1268,8 +1328,6 @@ class MacroAgentGraph:
           - {"type": "token", "delta": <str>}
           - {"type": "final", "response": <str>, "artifacts": {...}}
           - {"type": "error", "response": <str>}
-
-        Intermediate text from sub-agents is intentionally never emitted.
         """
         state = self._build_initial_state(message, chat_history or [])
         accumulated_artifacts: dict[str, Any] = {}
@@ -1277,10 +1335,8 @@ class MacroAgentGraph:
         final_state: dict[str, Any] = {}
 
         graph_config: dict[str, Any] = {"recursion_limit": self.recursion_limit}
-        synth_config: dict[str, Any] = {}
         if usage_tracker is not None:
             graph_config["callbacks"] = [usage_tracker]
-            synth_config["callbacks"] = [usage_tracker]
 
         try:
             async for chunk in self.graph.astream(state, config=graph_config):
@@ -1304,10 +1360,9 @@ class MacroAgentGraph:
                     elif output.get("guardrail_message"):
                         final_state["guardrail_message"] = output["guardrail_message"]
 
-                    for key in ("worker_results",):
-                        if output.get(key):
-                            final_state.setdefault(key, [])
-                            final_state[key].extend(output[key])
+                    if output.get("worker_results"):
+                        final_state.setdefault("worker_results", [])
+                        final_state["worker_results"].extend(output["worker_results"])
 
                     if output.get("messages"):
                         final_state.setdefault("messages", [])
@@ -1330,36 +1385,30 @@ class MacroAgentGraph:
                 }
                 return
 
-            stream_state = {
-                "messages": state["messages"],
-                "worker_results": final_state.get("worker_results", []),
-                "artifacts": accumulated_artifacts,
-            }
+            draft = self._sanitize_draft(last_isolated_task) or (
+                "I could not produce a response."
+            )
 
             collected: list[str] = []
             try:
-                async for delta in self._stream_final_synthesis(
-                    stream_state, last_isolated_task, config=synth_config
-                ):
+                async for delta in self._stream_supervisor_draft(draft):
                     collected.append(delta)
                     yield {"type": "token", "delta": delta}
-            except Exception as exc:
-                logger.exception("Final synthesis streaming failed")
-                fallback = last_isolated_task or "I could not produce a response."
+            except Exception:
+                logger.exception("Supervisor draft streaming failed")
                 if not collected:
-                    for ch in fallback:
+                    for ch in draft:
                         yield {"type": "token", "delta": ch}
                 yield {
                     "type": "final",
-                    "response": "".join(collected) or fallback,
+                    "response": "".join(collected) or draft,
                     "artifacts": accumulated_artifacts,
                 }
                 return
 
-            full_answer = "".join(collected) or last_isolated_task
             yield {
                 "type": "final",
-                "response": full_answer,
+                "response": "".join(collected) or draft,
                 "artifacts": accumulated_artifacts,
             }
         except Exception as exc:

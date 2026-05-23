@@ -1,16 +1,21 @@
-import plotly.express as px
+"""Education and human-capital page — literacy, enrolment, R&D workforce.
+
+Custom blocks: an adult-literacy × researchers-per-million scatter, and
+an enrolment-ladder deep dive showing primary → secondary → tertiary
+progression across countries.
+"""
+
 import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
 
 from core.page_helpers import fetch_indicator_slice
 from core.plotting import apply_plotly_theme
-from core.theming import get_color, get_colorway
 from core.postgres_client import (
     get_world_bank_country_mapping,
 )
-from pages.page_utils import render_page_from_config
-
+from core.theming import get_color, get_colorway
+from pages.page_utils import get_shared_selected_countries, render_page_from_config
 
 PAGE_TITLE = "Education and Human Capital"
 LITERACY_INDICATOR_ID = "SE.ADT.LITR.ZS"
@@ -18,6 +23,7 @@ RESEARCHERS_INDICATOR_ID = "SP.POP.SCIE.RD.P6"
 
 
 def _latest_per_country(df: pl.DataFrame, value_col: str, year_col: str) -> pl.DataFrame:
+    """Keep one row per country: the latest year present for ``value_col``."""
     if df.is_empty():
         return df
     return (
@@ -33,6 +39,7 @@ def _latest_per_country(df: pl.DataFrame, value_col: str, year_col: str) -> pl.D
 
 
 def _render_literacy_vs_researchers_overview() -> None:
+    """Render the literacy × researchers-per-million scatter at the top of the page."""
     st.subheader("Literacy vs Research Intensity")
     st.caption(
         "Adult literacy rate versus researchers per million people. Both series "
@@ -46,9 +53,7 @@ def _render_literacy_vs_researchers_overview() -> None:
     )
 
     if literacy_df.is_empty() or researchers_df.is_empty():
-        st.info(
-            "Literacy/researchers scatter is unavailable because source data is empty."
-        )
+        st.info("Literacy/researchers scatter is unavailable because source data is empty.")
         st.divider()
         return
 
@@ -70,9 +75,7 @@ def _render_literacy_vs_researchers_overview() -> None:
         return
 
     country_map = get_world_bank_country_mapping()
-    if not country_map.is_empty() and {"id", "value"}.issubset(
-        set(country_map.columns)
-    ):
+    if not country_map.is_empty() and {"id", "value"}.issubset(set(country_map.columns)):
         country_map = country_map.select(
             [
                 pl.col("id").cast(pl.Utf8).str.to_uppercase().alias("economy"),
@@ -87,7 +90,7 @@ def _render_literacy_vs_researchers_overview() -> None:
 
     selected_countries = {
         str(code).strip().upper()
-        for code in st.session_state.get(f"{PAGE_TITLE}_countries", [])
+        for code in get_shared_selected_countries()
         if str(code).strip()
     }
     joined_df = joined_df.with_columns(
@@ -99,35 +102,36 @@ def _render_literacy_vs_researchers_overview() -> None:
 
     plot_df = joined_df.to_pandas()
 
-    fig = px.scatter(
-        plot_df,
-        x="literacy_pct",
-        y="researchers_per_million",
-        color="country_group",
-        category_orders={"country_group": ["Other", "Selected"]},
-        color_discrete_map={
-            "Other": get_color("reference_line"),
-            "Selected": get_colorway()[0],
-        },
-        hover_name="country_name",
-        hover_data={
-            "economy": True,
-            "literacy_pct": ":.2f",
-            "researchers_per_million": ":,.0f",
-            "literacy_year": True,
-            "researchers_year": True,
-            "country_group": False,
-        },
-        labels={
-            "literacy_pct": "Adult literacy rate (%)",
-            "researchers_per_million": "Researchers per million (log)",
-            "literacy_year": "Literacy year",
-            "researchers_year": "Researchers year",
-            "country_group": "",
-        },
-        title="Literacy vs Research Intensity (latest year per country)",
-        log_y=True,
-    )
+    fig = go.Figure()
+    group_colors = {
+        "Other": get_color("reference_line"),
+        "Selected": get_colorway()[0],
+    }
+    for group_name in ("Other", "Selected"):
+        group_rows = plot_df[plot_df["country_group"] == group_name]
+        if group_rows.empty:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=group_rows["literacy_pct"],
+                y=group_rows["researchers_per_million"],
+                mode="markers",
+                name=group_name,
+                marker={
+                    "color": group_colors[group_name],
+                    "size": 9,
+                    "opacity": 0.78,
+                    "line": {"width": 0.5},
+                },
+                text=group_rows["country_name"],
+                customdata=group_rows[["economy", "literacy_year", "researchers_year"]].to_numpy(),
+                hovertemplate=(
+                    "<b>%{text}</b> (%{customdata[0]})<br>"
+                    "Literacy: %{x:.2f}% (year %{customdata[1]})<br>"
+                    "Researchers/M: %{y:,.0f} (year %{customdata[2]})<extra></extra>"
+                ),
+            )
+        )
 
     selected_df = plot_df[plot_df["country_group"] == "Selected"]
     if not selected_df.empty:
@@ -143,9 +147,11 @@ def _render_literacy_vs_researchers_overview() -> None:
             )
         )
 
-    fig.update_traces(
-        selector={"mode": "markers"},
-        marker={"size": 9, "opacity": 0.78, "line": {"width": 0.5}},
+    fig.update_layout(
+        title="Literacy vs Research Intensity (latest year per country)",
+        xaxis_title="Adult literacy rate (%)",
+        yaxis_title="Researchers per million (log)",
+        yaxis_type="log",
     )
     fig = apply_plotly_theme(fig)
 
@@ -164,6 +170,7 @@ TERTIARY_INDICATOR_ID = "SE.TER.ENRR"
 
 
 def _render_enrollment_ladder_deep_dive() -> None:
+    """Render the primary → secondary → tertiary enrolment ladder at the bottom of the page."""
     st.divider()
     st.subheader("Enrollment Ladder — Primary / Secondary / Tertiary")
     st.caption(
@@ -203,7 +210,7 @@ def _render_enrollment_ladder_deep_dive() -> None:
 
     selected_iso_codes = [
         str(c).strip().upper()
-        for c in st.session_state.get(f"{PAGE_TITLE}_countries", [])
+        for c in get_shared_selected_countries()
         if str(c).strip()
     ]
 
@@ -222,15 +229,12 @@ def _render_enrollment_ladder_deep_dive() -> None:
                 pl.col("tertiary").mean().alias("tertiary"),
             ]
         )
-        plot_df = (
-            means.with_columns(
-                [
-                    pl.lit("Global mean").alias("country_name"),
-                    pl.lit("---").alias("economy"),
-                ]
-            )
-            .to_pandas()
-        )
+        plot_df = means.with_columns(
+            [
+                pl.lit("Global mean").alias("country_name"),
+                pl.lit("---").alias("economy"),
+            ]
+        ).to_pandas()
         title = "Enrollment ratio (global cross-country mean)"
 
     fig = go.Figure()
@@ -245,10 +249,11 @@ def _render_enrollment_ladder_deep_dive() -> None:
                 orientation="h",
                 name=label,
                 marker={"color": colors[index % len(colors)] if colors else None},
-                customdata=plot_df.get(f"{column}_year") if f"{column}_year" in plot_df.columns else None,
+                customdata=plot_df.get(f"{column}_year")
+                if f"{column}_year" in plot_df.columns
+                else None,
                 hovertemplate=(
-                    "<b>%{y}</b><br>"
-                    f"{label}: %{{x:.1f}}% gross enrollment<extra></extra>"
+                    f"<b>%{{y}}</b><br>{label}: %{{x:.1f}}% gross enrollment<extra></extra>"
                 ),
             )
         )

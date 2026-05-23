@@ -1,17 +1,24 @@
-import plotly.express as px
+"""Health and well-being page — life expectancy, mortality, health spending.
+
+Custom blocks: the female-vs-male life-expectancy gap bar chart at the
+top, and an animated health-transition bubble at the bottom (analogous
+to the Hans-Rosling bubble on page 01 but over health metrics).
+"""
+
+import math
+
 import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
 
 from core.page_helpers import fetch_indicator_slice
 from core.plotting import apply_plotly_theme
-from core.theming import get_color, get_colorway
 from core.postgres_client import (
     get_world_bank_country_mapping,
     get_world_bank_country_regions,
 )
-from pages.page_utils import render_page_from_config
-
+from core.theming import get_color, get_colorway
+from pages.page_utils import get_shared_selected_countries, render_page_from_config
 
 PAGE_TITLE = "Health and wellbeing"
 LIFE_EXP_FEMALE_ID = "SP.DYN.LE00.FE.IN"
@@ -20,6 +27,7 @@ TOP_N_GAPS = 15
 
 
 def _render_life_expectancy_gap_overview() -> None:
+    """Render the female-minus-male life expectancy gap bar chart at the top of the page."""
     st.subheader("Life Expectancy Gender Gap")
     st.caption(
         "Female minus male life expectancy at birth in years. Positive values "
@@ -30,9 +38,7 @@ def _render_life_expectancy_gap_overview() -> None:
     male_df = fetch_indicator_slice(LIFE_EXP_MALE_ID, value_col="life_exp_male")
 
     if female_df.is_empty() or male_df.is_empty():
-        st.info(
-            "Life-expectancy gap bar is unavailable because source data is empty."
-        )
+        st.info("Life-expectancy gap bar is unavailable because source data is empty.")
         st.divider()
         return
 
@@ -46,13 +52,9 @@ def _render_life_expectancy_gap_overview() -> None:
         (pl.col("life_exp_female") - pl.col("life_exp_male")).alias("gap_years")
     )
 
-    year_options = (
-        joined_df.select("year").unique().sort("year").get_column("year").to_list()
-    )
+    year_options = joined_df.select("year").unique().sort("year").get_column("year").to_list()
     if not year_options:
-        st.info(
-            "Life-expectancy gap bar is unavailable because years are missing."
-        )
+        st.info("Life-expectancy gap bar is unavailable because years are missing.")
         st.divider()
         return
 
@@ -70,9 +72,7 @@ def _render_life_expectancy_gap_overview() -> None:
         return
 
     country_map = get_world_bank_country_mapping()
-    if not country_map.is_empty() and {"id", "value"}.issubset(
-        set(country_map.columns)
-    ):
+    if not country_map.is_empty() and {"id", "value"}.issubset(set(country_map.columns)):
         country_map = country_map.select(
             [
                 pl.col("id").cast(pl.Utf8).str.to_uppercase().alias("economy"),
@@ -87,7 +87,7 @@ def _render_life_expectancy_gap_overview() -> None:
 
     selected_iso_codes = [
         str(code).strip().upper()
-        for code in st.session_state.get(f"{PAGE_TITLE}_countries", [])
+        for code in get_shared_selected_countries()
         if str(code).strip()
     ]
 
@@ -95,8 +95,7 @@ def _render_life_expectancy_gap_overview() -> None:
     top_economies = set(top_df.get_column("economy").to_list())
 
     extra_selected_df = year_df.filter(
-        pl.col("economy").is_in(selected_iso_codes)
-        & ~pl.col("economy").is_in(list(top_economies))
+        pl.col("economy").is_in(selected_iso_codes) & ~pl.col("economy").is_in(list(top_economies))
     )
 
     combined_df = pl.concat([top_df, extra_selected_df], how="vertical_relaxed").sort(
@@ -133,7 +132,7 @@ def _render_life_expectancy_gap_overview() -> None:
                 name=group_name,
                 hovertemplate=(
                     "<b>%{y}</b><br>"
-                    f"Female - Male life expectancy: %{{x:.2f}} years<extra></extra>"
+                    "Female - Male life expectancy: %{x:.2f} years<extra></extra>"
                 ),
             )
         )
@@ -168,6 +167,7 @@ POPULATION_INDICATOR_ID = "SP.POP.TOTL"
 
 
 def _render_health_transition_deep_dive() -> None:
+    """Render the animated health-transition bubble chart at the bottom of the page."""
     st.divider()
     st.subheader("Demographic-Health Transition (animation)")
     st.caption(
@@ -206,36 +206,133 @@ def _render_health_transition_deep_dive() -> None:
         return
 
     plot_df = joined.to_pandas().sort_values(["year", "country_name"])
-    fig = px.scatter(
-        plot_df,
-        x="tfr",
-        y="u5m",
-        size="pop",
-        color="region",
-        animation_frame="year",
-        animation_group="economy",
-        hover_name="country_name",
-        hover_data={
-            "economy": True,
-            "tfr": ":.2f",
-            "u5m": ":.1f",
-            "pop": ":,.0f",
-            "region": True,
-            "year": False,
-        },
-        log_y=True,
-        size_max=55,
-        range_x=[max(0.5, float(plot_df["tfr"].min()) - 0.3), float(plot_df["tfr"].max()) + 0.3],
-        range_y=[max(1.0, float(plot_df["u5m"].min()) * 0.8), float(plot_df["u5m"].max()) * 1.2],
-        labels={
-            "tfr": "Fertility rate (births per woman)",
-            "u5m": "Under-5 mortality (per 1,000, log)",
-            "pop": "Population",
-            "region": "Region",
-        },
+    regions = sorted(plot_df["region"].dropna().unique().tolist())
+    years = sorted(plot_df["year"].dropna().unique().tolist())
+    palette = get_colorway()
+    region_colors = {
+        region: palette[idx % len(palette)] if palette else None
+        for idx, region in enumerate(regions)
+    }
+    pop_max = float(plot_df["pop"].max() or 1.0)
+    sizeref = 2.0 * pop_max / (55.0 * 55.0)
+
+    def _build_year_traces(year_value: int) -> list[go.Scatter]:
+        """Return one scatter trace per region for the given year (one animation frame)."""
+        year_df = plot_df[plot_df["year"] == year_value]
+        traces: list[go.Scatter] = []
+        for region in regions:
+            sub = year_df[year_df["region"] == region]
+            traces.append(
+                go.Scatter(
+                    x=sub["tfr"],
+                    y=sub["u5m"],
+                    mode="markers",
+                    name=region,
+                    marker={
+                        "size": sub["pop"],
+                        "sizemode": "area",
+                        "sizeref": sizeref,
+                        "sizemin": 4,
+                        "color": region_colors[region],
+                        "opacity": 0.72,
+                        "line": {"width": 0.5},
+                    },
+                    text=sub["country_name"],
+                    customdata=sub[["economy", "tfr", "u5m", "pop", "region"]].to_numpy(),
+                    hovertemplate=(
+                        "<b>%{text}</b> (%{customdata[0]})<br>"
+                        "Region: %{customdata[4]}<br>"
+                        "Fertility: %{customdata[1]:.2f}<br>"
+                        "Under-5 mortality: %{customdata[2]:.1f}<br>"
+                        "Population: %{customdata[3]:,.0f}<extra></extra>"
+                    ),
+                )
+            )
+        return traces
+
+    initial_traces = _build_year_traces(years[0])
+    frames = [
+        go.Frame(data=_build_year_traces(year_value), name=str(year_value)) for year_value in years
+    ]
+
+    y_min = max(1.0, float(plot_df["u5m"].min()) * 0.8)
+    y_max = float(plot_df["u5m"].max()) * 1.2
+
+    fig = go.Figure(data=initial_traces, frames=frames)
+    fig.update_layout(
         title="Fertility vs Under-5 Mortality over time",
+        xaxis_title="Fertility rate (births per woman)",
+        yaxis_title="Under-5 mortality (per 1,000, log)",
+        xaxis_range=[
+            max(0.5, float(plot_df["tfr"].min()) - 0.3),
+            float(plot_df["tfr"].max()) + 0.3,
+        ],
+        yaxis_type="log",
+        yaxis_range=[math.log10(y_min), math.log10(y_max)],
+        margin={"l": 60, "r": 40, "t": 60, "b": 110},
+        updatemenus=[
+            {
+                "type": "buttons",
+                "direction": "left",
+                "showactive": False,
+                "x": 0.1,
+                "xanchor": "right",
+                "y": 0,
+                "yanchor": "top",
+                "pad": {"r": 10, "t": 70},
+                "buttons": [
+                    {
+                        "label": "Play",
+                        "method": "animate",
+                        "args": [
+                            None,
+                            {
+                                "frame": {"duration": 500, "redraw": True},
+                                "fromcurrent": True,
+                            },
+                        ],
+                    },
+                    {
+                        "label": "Pause",
+                        "method": "animate",
+                        "args": [
+                            [None],
+                            {
+                                "frame": {"duration": 0, "redraw": False},
+                                "mode": "immediate",
+                            },
+                        ],
+                    },
+                ],
+            }
+        ],
+        sliders=[
+            {
+                "active": 0,
+                "x": 0.1,
+                "xanchor": "left",
+                "y": 0,
+                "yanchor": "top",
+                "len": 0.9,
+                "pad": {"b": 10, "t": 50},
+                "currentvalue": {"prefix": "Year: "},
+                "steps": [
+                    {
+                        "args": [
+                            [str(year_value)],
+                            {
+                                "frame": {"duration": 0, "redraw": True},
+                                "mode": "immediate",
+                            },
+                        ],
+                        "label": str(year_value),
+                        "method": "animate",
+                    }
+                    for year_value in years
+                ],
+            }
+        ],
     )
-    fig.update_traces(marker={"opacity": 0.72, "line": {"width": 0.5}})
     fig = apply_plotly_theme(fig)
 
     st.plotly_chart(fig, width="stretch")

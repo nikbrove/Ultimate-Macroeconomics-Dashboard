@@ -1,19 +1,27 @@
+"""Clustering sandbox — KMeans / DBSCAN over user-picked indicators.
+
+The user assembles a feature set from any indicators in the config
+(absolute values or year-over-year change), pushes it through the
+clustering FastAPI service, and the page renders the resulting 2-D
+projection plus a cluster-membership table.
+"""
+
 from __future__ import annotations
 
-import plotly.express as px
+import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
 
-from core.app_logging import log_page_render
 from core.api_client import cluster_dataframe
+from core.app_logging import log_page_render
 from core.plotting import apply_plotly_theme
 from core.postgres_client import (
     get_world_bank_country_mapping,
     get_world_bank_indicator,
     get_world_bank_indicator_name,
 )
+from core.theming import get_colorway
 from pages.page_utils import load_dashboard_config
-
 
 RESULT_STATE_KEY = "clustering_sandbox_result"
 MAX_INDICATORS = 8
@@ -25,6 +33,7 @@ VIZ_Y_COL = "__viz_y"
 
 @st.cache_data(show_spinner=False)
 def _indicator_years(indicator_id: str) -> list[int]:
+    """Return the sorted list of years where ``indicator_id`` has non-null values."""
     df = get_world_bank_indicator(indicator_id, country_code="ALL")
     if df.is_empty() or "year" not in df.columns or "value" not in df.columns:
         return []
@@ -42,15 +51,13 @@ def _indicator_years(indicator_id: str) -> list[int]:
 
 @st.cache_data(show_spinner=False)
 def _indicator_year_slice(indicator_id: str, year: int) -> pl.DataFrame:
+    """Return ``(economy, indicator_id_value)`` for one year, aggregated by mean per economy."""
     df = get_world_bank_indicator(indicator_id, country_code="ALL")
     if df.is_empty() or not {"year", "economy", "value"}.issubset(df.columns):
         return pl.DataFrame()
 
     return (
-        df.filter(
-            (pl.col("year").cast(pl.Int64) == int(year))
-            & pl.col("economy").is_not_null()
-        )
+        df.filter((pl.col("year").cast(pl.Int64) == int(year)) & pl.col("economy").is_not_null())
         .select(
             [
                 pl.col("economy").cast(pl.Utf8).str.to_uppercase().alias("economy"),
@@ -68,15 +75,24 @@ def _indicator_feature_slice(
     year: int,
     feature_mode: str,
 ) -> pl.DataFrame:
+    """Compute the feature column for one indicator: absolute value or YoY change.
+
+    Args:
+        indicator_id: WB indicator id.
+        year: Reference year.
+        feature_mode: :data:`FEATURE_MODE_ABSOLUTE` or :data:`FEATURE_MODE_CHANGE`.
+
+    Returns:
+        Frame with columns ``economy`` and ``indicator_id`` (null when
+        the previous year is missing in change mode).
+    """
     current_df = _indicator_year_slice(indicator_id, year)
     if feature_mode == FEATURE_MODE_ABSOLUTE or current_df.is_empty():
         return current_df
 
     previous_df = _indicator_year_slice(indicator_id, year - 1)
     if previous_df.is_empty():
-        return current_df.with_columns(
-            pl.lit(None).cast(pl.Float64).alias(indicator_id)
-        )
+        return current_df.with_columns(pl.lit(None).cast(pl.Float64).alias(indicator_id))
 
     joined_df = current_df.rename({indicator_id: "current_value"}).join(
         previous_df.rename({indicator_id: "previous_value"}),
@@ -91,16 +107,14 @@ def _indicator_feature_slice(
             | (pl.col("previous_value") == 0)
         )
         .then(None)
-        .otherwise(
-            (pl.col("current_value") - pl.col("previous_value"))
-            / pl.col("previous_value")
-        )
+        .otherwise((pl.col("current_value") - pl.col("previous_value")) / pl.col("previous_value"))
         .cast(pl.Float64)
         .alias(indicator_id)
     ).select(["economy", indicator_id])
 
 
 def _feature_label(feature_name: str, feature_mode: str, base_label: str) -> str:
+    """Build the human-readable column label suffixed with the feature mode."""
     if feature_mode == FEATURE_MODE_CHANGE:
         return f"{base_label} (YoY change)"
     return f"{base_label} (absolute)"
@@ -111,6 +125,7 @@ def _normalize_features(
     feature_columns: list[str],
     mode: str,
 ) -> pl.DataFrame:
+    """Z-score or min-max normalise the given columns; ``"none"`` is a passthrough."""
     if mode == "none":
         return df
 
@@ -145,6 +160,7 @@ def _apply_missing_strategy(
     feature_columns: list[str],
     strategy: str,
 ) -> pl.DataFrame:
+    """Handle nulls in feature columns: ``"drop"`` rows or fill with mean/median."""
     if strategy == "drop":
         return df.drop_nulls(subset=feature_columns)
 
@@ -154,9 +170,7 @@ def _apply_missing_strategy(
             fill_val = float(filled[col_name].mean()) if filled.height else 0.0
         else:
             fill_val = float(filled[col_name].median()) if filled.height else 0.0
-        filled = filled.with_columns(
-            pl.col(col_name).fill_null(fill_val).alias(col_name)
-        )
+        filled = filled.with_columns(pl.col(col_name).fill_null(fill_val).alias(col_name))
     return filled
 
 
@@ -166,14 +180,13 @@ def _render_visuals(
     visualization_labels: list[str],
     visualization_mode: str,
 ) -> None:
+    """Render the cluster scatter (left) and a world map shaded by cluster (right)."""
     if result_df.is_empty():
         st.info("No clustering result to visualize.")
         return
 
     if len(visualization_columns) < 2:
-        st.warning(
-            "Clustering response does not contain valid visualization coordinates."
-        )
+        st.warning("Clustering response does not contain valid visualization coordinates.")
         return
 
     scatter_x, scatter_y = visualization_columns[0], visualization_columns[1]
@@ -181,12 +194,8 @@ def _render_visuals(
         st.warning("Clustering response is missing scatterplot coordinate columns.")
         return
 
-    x_axis_title = (
-        visualization_labels[0] if len(visualization_labels) > 0 else scatter_x
-    )
-    y_axis_title = (
-        visualization_labels[1] if len(visualization_labels) > 1 else scatter_y
-    )
+    x_axis_title = visualization_labels[0] if len(visualization_labels) > 0 else scatter_x
+    y_axis_title = visualization_labels[1] if len(visualization_labels) > 1 else scatter_y
 
     plot_df = result_df.to_pandas()
     plot_df["cluster_label"] = plot_df["cluster"].astype(str)
@@ -196,21 +205,39 @@ def _render_visuals(
     st.subheader("Cluster Visualization")
     left, right = st.columns([0.55, 0.45])
 
+    unique_clusters = sorted(plot_df["cluster_label"].unique(), key=str)
+    palette = get_colorway()
+    cluster_colors = {
+        label: palette[idx % len(palette)] if palette else None
+        for idx, label in enumerate(unique_clusters)
+    }
+
     with left:
-        scatter_fig = px.scatter(
-            plot_df,
-            x=scatter_x,
-            y=scatter_y,
-            color="cluster_label",
-            hover_name="country_name",
-            hover_data={"economy": True, "cluster_label": True},
-            title=(
-                "Feature Space"
-                if visualization_mode == "feature_space"
-                else "t-SNE Projection"
-            ),
-        )
+        scatter_fig = go.Figure()
+        for cluster_label in unique_clusters:
+            sub = plot_df[plot_df["cluster_label"] == cluster_label]
+            scatter_fig.add_trace(
+                go.Scatter(
+                    x=sub[scatter_x],
+                    y=sub[scatter_y],
+                    mode="markers",
+                    name=f"Cluster {cluster_label}",
+                    marker={"color": cluster_colors[cluster_label]},
+                    text=sub["country_name"],
+                    customdata=sub[["economy", "cluster_label"]].to_numpy(),
+                    hovertemplate=(
+                        "<b>%{text}</b><br>%{customdata[0]}<br>"
+                        "Cluster: %{customdata[1]}<extra></extra>"
+                    ),
+                )
+            )
+        projection_title = {
+            "feature_space": "Feature Space",
+            "tsne": "t-SNE Projection",
+            "pca": "PCA Projection",
+        }.get(visualization_mode, "Projection")
         scatter_fig.update_layout(
+            title=projection_title,
             xaxis_title=x_axis_title,
             yaxis_title=y_axis_title,
         )
@@ -218,22 +245,37 @@ def _render_visuals(
         st.plotly_chart(scatter_fig, width="stretch")
 
     with right:
-        map_fig = px.choropleth(
-            plot_df,
-            locations="economy",
-            locationmode="ISO-3",
-            color="cluster_label",
-            hover_name="country_name",
-            hover_data={"economy": True, "cluster_label": True},
+        map_fig = go.Figure()
+        for cluster_label in unique_clusters:
+            sub = plot_df[plot_df["cluster_label"] == cluster_label]
+            cluster_color = cluster_colors[cluster_label]
+            map_fig.add_trace(
+                go.Choropleth(
+                    locations=sub["economy"],
+                    z=[1] * len(sub),
+                    text=sub["country_name"],
+                    customdata=sub[["economy", "cluster_label"]].to_numpy(),
+                    locationmode="ISO-3",
+                    colorscale=[[0, cluster_color], [1, cluster_color]],
+                    showscale=False,
+                    name=f"Cluster {cluster_label}",
+                    hovertemplate=(
+                        "<b>%{text}</b><br>%{customdata[0]}<br>"
+                        "Cluster: %{customdata[1]}<extra></extra>"
+                    ),
+                )
+            )
+        map_fig.update_layout(
             title="Cluster Map",
-            projection="natural earth",
+            geo={"projection_type": "natural earth"},
+            margin={"l": 0, "r": 0, "t": 40, "b": 0},
         )
-        map_fig.update_layout(margin=dict(l=0, r=0, t=40, b=0))
         map_fig = apply_plotly_theme(map_fig)
         st.plotly_chart(map_fig, width="stretch")
 
 
 def render_page() -> None:
+    """Page entry-point: form for feature selection + run button + visuals."""
     log_page_render("Clustering Sandbox")
     st.title("Clustering Sandbox")
     st.caption(
@@ -258,9 +300,7 @@ def render_page() -> None:
         return
 
     indicator_ids = [str(item["id"]) for item in section_items]
-    fallback_by_id = {
-        str(item["id"]): str(item.get("name", item["id"])) for item in section_items
-    }
+    fallback_by_id = {str(item["id"]): str(item.get("name", item["id"])) for item in section_items}
     label_by_id = {
         indicator_id: (
             get_world_bank_indicator_name(indicator_id, preferred_database_id="2")
@@ -314,15 +354,11 @@ def render_page() -> None:
         years = set(_indicator_years(indicator_id))
         if feature_mode_by_indicator[indicator_id] == FEATURE_MODE_CHANGE:
             years = {year for year in years if (year - 1) in years}
-        common_years = (
-            years if common_years is None else common_years.intersection(years)
-        )
+        common_years = years if common_years is None else common_years.intersection(years)
 
     year_options = sorted(common_years or [])
     if not year_options:
-        st.warning(
-            "No common years with non-null values were found for the selected indicators."
-        )
+        st.warning("No common years with non-null values were found for the selected indicators.")
         return
 
     selected_year = st.select_slider(
@@ -354,9 +390,7 @@ def render_page() -> None:
         if method == "kmeans":
             k = st.slider("k clusters", min_value=2, max_value=12, value=4)
             n_init = st.slider("n_init", min_value=5, max_value=50, value=10)
-            random_state = st.number_input(
-                "random_state", min_value=0, max_value=9999, value=42
-            )
+            random_state = st.number_input("random_state", min_value=0, max_value=9999, value=42)
             eps = 0.5
             min_samples = 5
         else:
@@ -365,6 +399,21 @@ def render_page() -> None:
             k = 3
             n_init = 10
             random_state = 42
+
+        # Dim-reduction only matters when there are >2 features to project.
+        if len(selected_indicators) > 2:
+            reduction_method = st.radio(
+                "Dim-reduction (for 2D projection)",
+                options=["tsne", "pca"],
+                format_func=lambda m: "t-SNE" if m == "tsne" else "PCA",
+                horizontal=True,
+                help=(
+                    "t-SNE preserves local neighborhoods; PCA preserves global variance "
+                    "and runs faster on larger feature sets."
+                ),
+            )
+        else:
+            reduction_method = "tsne"  # ignored server-side when n_features <= 2
 
     run_button = st.button("Run clustering", type="primary", width="stretch")
 
@@ -385,9 +434,9 @@ def render_page() -> None:
                     feature_df = feature_df.join(slice_df, on="economy", how="full")
                     if "economy_right" in feature_df.columns:
                         feature_df = feature_df.with_columns(
-                            pl.coalesce(
-                                [pl.col("economy"), pl.col("economy_right")]
-                            ).alias("economy")
+                            pl.coalesce([pl.col("economy"), pl.col("economy_right")]).alias(
+                                "economy"
+                            )
                         ).drop("economy_right")
 
             if feature_df is None or feature_df.is_empty():
@@ -413,9 +462,7 @@ def render_page() -> None:
                 normalization,
             )
 
-            api_rows = transformed_df.select(
-                ["economy", *selected_indicators]
-            ).to_dicts()
+            api_rows = transformed_df.select(["economy", *selected_indicators]).to_dicts()
 
             try:
                 api_result = cluster_dataframe(
@@ -427,6 +474,7 @@ def render_page() -> None:
                     random_state=int(random_state),
                     eps=float(eps),
                     min_samples=int(min_samples),
+                    reduction_method=str(reduction_method),
                 )
             except Exception as exc:
                 st.error(
@@ -439,9 +487,7 @@ def render_page() -> None:
                 st.error("Clustering API returned an empty response.")
                 return
 
-            visualization_columns = api_result.get(
-                "visualization_columns", [VIZ_X_COL, VIZ_Y_COL]
-            )
+            visualization_columns = api_result.get("visualization_columns", [VIZ_X_COL, VIZ_Y_COL])
             if not isinstance(visualization_columns, list):
                 visualization_columns = [VIZ_X_COL, VIZ_Y_COL]
             visualization_columns = [str(col) for col in visualization_columns]
@@ -459,9 +505,7 @@ def render_page() -> None:
             )
 
             country_map = get_world_bank_country_mapping()
-            if not country_map.is_empty() and {"id", "value"}.issubset(
-                set(country_map.columns)
-            ):
+            if not country_map.is_empty() and {"id", "value"}.issubset(set(country_map.columns)):
                 mapping_df = country_map.select(
                     [
                         pl.col("id").cast(pl.Utf8).str.to_uppercase().alias("economy"),
@@ -470,9 +514,7 @@ def render_page() -> None:
                 )
                 cluster_df = cluster_df.join(mapping_df, on="economy", how="left")
             else:
-                cluster_df = cluster_df.with_columns(
-                    pl.col("economy").alias("country_name")
-                )
+                cluster_df = cluster_df.with_columns(pl.col("economy").alias("country_name"))
 
             st.session_state[RESULT_STATE_KEY] = {
                 "result_df": cluster_df,
@@ -507,12 +549,7 @@ def render_page() -> None:
     metric_col_4.metric("Distinct labels", int(state["n_clusters"]))
 
     if "cluster" in result_df.columns:
-        counts_df = (
-            result_df.group_by("cluster")
-            .len()
-            .sort("cluster")
-            .rename({"len": "countries"})
-        )
+        counts_df = result_df.group_by("cluster").len().sort("cluster").rename({"len": "countries"})
         st.dataframe(counts_df, width="stretch")
 
     feature_columns = list(state.get("feature_columns", []))
@@ -532,9 +569,7 @@ def render_page() -> None:
 
     _render_visuals(
         result_df=result_df,
-        visualization_columns=list(
-            state.get("visualization_columns", default_viz_columns)
-        ),
+        visualization_columns=list(state.get("visualization_columns", default_viz_columns)),
         visualization_labels=list(state.get("visualization_labels", [])),
         visualization_mode=str(state.get("visualization_mode", "feature_space")),
     )

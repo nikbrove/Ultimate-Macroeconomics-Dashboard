@@ -1,15 +1,22 @@
+"""Governance and institutions page — World Governance Indicators (WGI).
+
+Renders a 6-axis radar comparing selected countries on Rule of Law,
+Control of Corruption, Government Effectiveness, Voice and
+Accountability, Regulatory Quality and Political Stability, plus a
+country × dimension heatmap for the latest year.
+"""
+
 import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
 
 from core.page_helpers import fetch_indicator_slice
 from core.plotting import apply_plotly_theme
-from core.theming import get_color, get_colorway, get_diverging_colorscale
 from core.postgres_client import (
     get_world_bank_country_mapping,
 )
-from pages.page_utils import render_page_from_config
-
+from core.theming import get_color, get_colorway, get_diverging_colorscale
+from pages.page_utils import get_shared_selected_countries, render_page_from_config
 
 PAGE_TITLE = "Governance and Institutions"
 
@@ -24,6 +31,12 @@ WGI_DIMENSIONS: list[tuple[str, str]] = [
 
 
 def _build_wgi_panel() -> pl.DataFrame:
+    """Join every WGI dimension into one ``year × economy`` panel.
+
+    Returns:
+        Polars frame with one column per dimension; empty when no
+        dimensions are loaded.
+    """
     panel: pl.DataFrame | None = None
     for indicator_id, label in WGI_DIMENSIONS:
         slice_df = fetch_indicator_slice(indicator_id, value_col=label)
@@ -32,14 +45,13 @@ def _build_wgi_panel() -> pl.DataFrame:
         panel = (
             slice_df
             if panel is None
-            else panel.join(
-                slice_df, on=["year", "economy"], how="full", coalesce=True
-            )
+            else panel.join(slice_df, on=["year", "economy"], how="full", coalesce=True)
         )
     return panel if panel is not None else pl.DataFrame()
 
 
 def _render_wgi_radar_overview() -> None:
+    """Render the WGI radar comparing selected countries on six axes."""
     st.subheader("Governance Radar")
     st.caption(
         "Compares World Governance Indicators across countries. Each axis is a "
@@ -55,9 +67,7 @@ def _render_wgi_radar_overview() -> None:
         st.divider()
         return
 
-    year_options = (
-        panel_df.select("year").unique().sort("year").get_column("year").to_list()
-    )
+    year_options = panel_df.select("year").unique().sort("year").get_column("year").to_list()
     if not year_options:
         st.info("WGI radar is unavailable because years are missing.")
         st.divider()
@@ -87,7 +97,7 @@ def _render_wgi_radar_overview() -> None:
 
     selected_iso_codes = [
         str(code).strip().upper()
-        for code in st.session_state.get(f"{PAGE_TITLE}_countries", [])
+        for code in get_shared_selected_countries()
         if str(code).strip()
     ]
 
@@ -171,6 +181,7 @@ HEATMAP_BOTTOM_N = 15
 
 
 def _render_wgi_heatmap_deep_dive() -> None:
+    """Render the country × dimension WGI heatmap at the bottom of the page."""
     st.divider()
     st.subheader("Governance Heatmap")
     st.caption(
@@ -198,10 +209,7 @@ def _render_wgi_heatmap_deep_dive() -> None:
     means = series.group_by("economy").agg(pl.col("wgi").mean().alias("wgi_mean"))
     top = means.sort("wgi_mean", descending=True).head(HEATMAP_TOP_N)
     bottom = means.sort("wgi_mean").head(HEATMAP_BOTTOM_N)
-    keepers = (
-        pl.concat([top, bottom], how="vertical_relaxed")
-        .sort("wgi_mean", descending=True)
-    )
+    keepers = pl.concat([top, bottom], how="vertical_relaxed").sort("wgi_mean", descending=True)
     keep_economies = keepers.get_column("economy").to_list()
 
     panel = series.filter(pl.col("economy").is_in(keep_economies))

@@ -1,3 +1,10 @@
+"""Pydantic schemas + LangGraph state shape for the multi-agent analyst.
+
+Every structured-output LLM call in :mod:`agent.graph` materialises one of
+these models via ``with_structured_output(...)``; ``AgentState`` is the graph
+state shape itself and must remain a ``TypedDict`` per LangGraph's contract.
+"""
+
 import operator
 from typing import Annotated, Any, Dict, Literal, Sequence, TypedDict
 
@@ -6,7 +13,18 @@ from pydantic import BaseModel, Field
 
 
 def _merge_artifacts(existing: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
-    """Shallow-merge new artifact keys into the existing dict."""
+    """Shallow-merge ``new`` artifact keys into ``existing``.
+
+    Used as the channel reducer for ``AgentState.artifacts`` so a worker that
+    returns ``{"figure": ...}`` doesn't clobber an earlier ``{"table": ...}``.
+
+    Args:
+        existing: Accumulated artifacts so far.
+        new: New artifacts from the current step.
+
+    Returns:
+        Merged dict. ``new`` keys win on conflict.
+    """
     if not existing:
         return new
     merged = existing.copy()
@@ -14,6 +32,32 @@ def _merge_artifacts(existing: Dict[str, Any], new: Dict[str, Any]) -> Dict[str,
     return merged
 
 
+WORKER_STATUS_LITERAL = Literal[
+    "SUCCESS",
+    "EMPTY",
+    "ERROR",
+    "NEEDS_DOWNLOAD",
+    "BLOCKED",
+    "UNKNOWN",
+]
+"""Coarse outcome tag a worker returns alongside its worker_results string.
+
+The supervisor can branch off this tag deterministically instead of regex-
+matching prose; the per-worker semantics are:
+
+* ``SUCCESS`` — produced useful output and/or wrote an artifact.
+* ``EMPTY``   — ran cleanly but found nothing (zero rows, no articles, ...).
+* ``ERROR``   — the worker itself failed (exception, sandbox error, ...).
+* ``NEEDS_DOWNLOAD`` — sql_agent found the indicator in ``database_indicators``
+  but the ``indicators`` table is empty for it; route to downloader_agent.
+* ``BLOCKED`` — refused due to a precondition (e.g. no data in artifacts).
+* ``UNKNOWN`` — pre-channel-default; should never appear after a worker runs.
+"""
+
+
+# Must stay a TypedDict — LangGraph requires the graph state schema to be a
+# TypedDict (it uses Annotated[..., reducer] for channel merging). Every other
+# data model in this service is a pydantic.BaseModel.
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], operator.add]
     worker_results: Annotated[Sequence[str], operator.add]
@@ -22,6 +66,7 @@ class AgentState(TypedDict):
     isolated_worker_task: str
     artifacts: Annotated[Dict[str, Any], _merge_artifacts]
     last_worker: str
+    last_worker_status: str
     retry_count: int
     trace: Annotated[list[str], operator.add]
     guardrail_blocked: bool
@@ -41,6 +86,8 @@ WORKER_LITERAL = Literal[
 
 
 class SupervisorDecision(BaseModel):
+    """One supervisor turn: which worker to invoke next (or FINISH)."""
+
     thought_process: str = Field(
         description=(
             "Deep, step-by-step reasoning about the current state. "
@@ -71,6 +118,8 @@ class SupervisorDecision(BaseModel):
 
 
 class SQLGeneration(BaseModel):
+    """One SQL exploration/final step produced by the ``sql_agent`` worker."""
+
     thought_process: str = Field(
         description=(
             "Step-by-step reasoning about which tables, columns, joins, "
@@ -97,24 +146,27 @@ class SQLGeneration(BaseModel):
 
 
 class PlotlyCodeGeneration(BaseModel):
+    """Code snippet produced by the ``plotly_agent`` worker for the sandbox."""
+
     thought_process: str = Field(
         description="Step-by-step reasoning about how to visualize the data."
     )
     plotly_code: str = Field(
         description=(
-            "Executable Python code using plotly to create a visualization. "
+            "Executable Python code using plotly.graph_objects (imported as `go`) "
+            "to create a visualization. Do NOT use plotly.express. "
             "Input data is available as `data` (a list of dicts). "
             "The final figure must be assigned to a variable named `fig`. "
-            "Do NOT call fig.show(). Import plotly modules as needed."
+            "Do NOT call fig.show()."
         )
     )
     title: str = Field(description="A concise, descriptive title for the chart.")
 
 
 class PolarsCodeGeneration(BaseModel):
-    thought_process: str = Field(
-        description="Step-by-step reasoning on how to transform the data."
-    )
+    """Polars transformation snippet produced by the ``table_agent`` worker."""
+
+    thought_process: str = Field(description="Step-by-step reasoning on how to transform the data.")
     polars_code: str = Field(
         description=(
             "Executable Python Polars code. "
@@ -125,6 +177,8 @@ class PolarsCodeGeneration(BaseModel):
 
 
 class RAGSearchPlan(BaseModel):
+    """Search request emitted by the ``rag_agent`` worker against Qdrant news."""
+
     thought_process: str = Field(
         description="Reasoning about what to search for in the news vector DB."
     )
@@ -152,9 +206,9 @@ class RAGSearchPlan(BaseModel):
 
 
 class WebSearchPlan(BaseModel):
-    thought_process: str = Field(
-        description="Reasoning about what to search for on the internet."
-    )
+    """DuckDuckGo fallback search plan from the ``web_search`` worker."""
+
+    thought_process: str = Field(description="Reasoning about what to search for on the internet.")
     search_queries: list[str] = Field(
         description="List of 1-3 search queries to execute.",
         min_length=1,
@@ -163,25 +217,28 @@ class WebSearchPlan(BaseModel):
 
 
 class DownloadIndicatorPlan(BaseModel):
+    """On-demand ingestion request from the ``downloader_agent`` worker."""
+
     thought_process: str = Field(
         description="Reasoning about which World Bank indicator to download."
     )
-    indicator_id: str = Field(
-        description="The World Bank indicator ID (e.g. 'NY.GDP.MKTP.CD')."
-    )
+    indicator_id: str = Field(description="The World Bank indicator ID (e.g. 'NY.GDP.MKTP.CD').")
     db_id: int = Field(description="The World Bank database ID (e.g. 2 for WDI).")
 
 
 class ChatSynthesis(BaseModel):
+    """Final markdown answer composed by the ``chat_agent`` worker."""
+
     response: str = Field(
         description=(
-            "A complete, well-formatted response for the user. "
-            "Use markdown where appropriate."
+            "A complete, well-formatted response for the user. Use markdown where appropriate."
         )
     )
 
 
 class GuardrailDecision(BaseModel):
+    """Output of the guardrail screening step on each new user message."""
+
     is_inappropriate: bool = Field(
         description=(
             "True if the user's message contains harsh language, personal "
@@ -204,22 +261,37 @@ class GuardrailDecision(BaseModel):
 
 
 class ChatMessage(BaseModel):
+    """One turn of chat history (``role`` / ``content``)."""
+
     role: str
     content: str
 
 
 class ChatRequest(BaseModel):
+    """Body accepted by ``POST /chat/stream``."""
+
     user_message: str
     chat_history: list[ChatMessage] = Field(default_factory=list)
 
 
 class PlotInterpretationRequest(BaseModel):
+    """Body accepted by ``POST /plots/interpret``.
+
+    Args:
+        image_base64: Base64-encoded PNG of the rendered Plotly chart.
+        mode: ``no_hallucinations`` for strict description; anything else
+            switches to interpretive analyst mode.
+        chart_context: Optional human-supplied caption fed to the LLM.
+    """
+
     image_base64: str
     mode: str = "no_hallucinations"
     chart_context: str = ""
 
 
 class TokenUsage(BaseModel):
+    """Per-call token counts returned alongside every model response."""
+
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
@@ -227,6 +299,8 @@ class TokenUsage(BaseModel):
 
 
 class PlotInterpretationResponse(BaseModel):
+    """Response from ``POST /plots/interpret``."""
+
     description: str
     mode: str
     model: str

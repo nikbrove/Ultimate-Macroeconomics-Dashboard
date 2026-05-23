@@ -1,13 +1,16 @@
+"""Abstract base class + shared helpers for every forecaster implementation."""
+
 from abc import ABC, abstractmethod
-import polars as pl
+
 import pandas as pd
+import polars as pl
 
 
 class BaseForecaster(ABC):
-    """Class constructor for forecaster objects"""
+    """Abstract base for every concrete forecaster (ARIMA, Prophet, Chronos)."""
 
     def __init__(self):
-        pass
+        """No-op constructor — subclasses override with model-specific setup."""
 
     @abstractmethod
     def predict(
@@ -16,14 +19,37 @@ class BaseForecaster(ABC):
         n_predict: int,
         alpha: float,
     ) -> pl.DataFrame:
-        pass
+        """Produce ``n_predict`` future points with a ``(1-alpha)`` confidence band.
+
+        Args:
+            df: Two-column Polars frame with ``ds`` (datetime) and ``y`` (float),
+                already sorted ascending by ``ds``.
+            n_predict: Number of future points to emit.
+            alpha: Significance level for the confidence interval.
+
+        Returns:
+            Polars frame with columns ``ds``, ``yhat``, ``yhat_lower``, ``yhat_upper``.
+        """
 
 
 def resolve_forecast_frequency(
     datetimes: pd.DatetimeIndex | list[pd.Timestamp],
     default: str = "D",
 ) -> str:
-    """Infer a stable frequency, with a robust fallback for short or irregular series."""
+    """Infer a stable pandas frequency string for ``datetimes``.
+
+    First asks pandas to infer the frequency; if that fails (e.g. the series
+    is irregular), falls back to the modal positive gap between successive
+    timestamps. Returns ``default`` for series with fewer than two points or
+    when no positive gap is available.
+
+    Args:
+        datetimes: Historical timestamps; need not be sorted.
+        default: Frequency to return when nothing better can be inferred.
+
+    Returns:
+        A pandas frequency string suitable for ``pd.date_range(freq=...)``.
+    """
     idx = pd.DatetimeIndex(pd.to_datetime(datetimes)).sort_values()
     if len(idx) < 2:
         return default

@@ -1,10 +1,10 @@
 name: Ultimate_Macroeconomics_Dashboard
 
 services:
-  
+
   db:
     image: postgres:18
-    restart: always
+    restart: unless-stopped
     container_name: postgres_db
     env_file:
       - ./_container_data/.env
@@ -19,22 +19,10 @@ services:
       timeout: 5s
       retries: 10
       start_period: 10s
-    
-  db_init:
-    image: postgres:18
-    restart: "no"
-    env_file:
-      - ./_container_data/.env
-    volumes:
-      - ./_container_data/db_init.sh:/db_init.sh:ro
-    entrypoint: ["/bin/bash", "/db_init.sh"]
-    depends_on:
-      db:
-        condition: service_healthy
 
   vector_db:
     image: qdrant/qdrant:v1.17
-    restart: always
+    restart: unless-stopped
     container_name: qdrant_db
     env_file:
       - ./_container_data/.env
@@ -42,67 +30,39 @@ services:
       - 6333:6333
     volumes:
       - qdrant_data:/qdrant/storage
-  
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
   downloader_general:
     build:
       context: downloader_general
       dockerfile: Dockerfile
     container_name: downloader_general
+    restart: "no"
     tty: true
     env_file:
       - ./_container_data/.env
     depends_on:
       db:
         condition: service_healthy
-      db_init:
-        condition: service_completed_successfully
       vector_db:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ./_container_data/config.yaml:/app/config.yaml:ro
       - ./_container_data/database_schema.yaml:/app/database_schema.yaml:ro
       - ./_container_data/_configs:/app/_configs
       - ./_container_data/downloader_general:/app/_container_data
 
-  app:
-    build:
-      context: app
-      dockerfile: Dockerfile
-    container_name: app
-    env_file:
-      - ./_container_data/.env
-    ports:
-      - 8501:8501
-    depends_on:
-      db:
-        condition: service_healthy
-      db_init:
-        condition: service_completed_successfully
-      vector_db:
-        condition: service_started
-      agent:
-        condition: service_started
-      forecaster:
-        condition: service_started
-      clustering:
-        condition: service_started
-      python_sandbox:
-        condition: service_started
-      downloader_general:
-        condition: service_started
-      downloader_extra:
-        condition: service_started
-    volumes:
-      - ./_container_data/config.yaml:/app/config.yaml:ro
-      - ./_container_data/themes.yaml:/app/themes.yaml
-      - ./_container_data/_configs:/app/_configs
-      - ./_container_data/app:/app/_container_data
-
   agent:
     build:
       context: agent
       dockerfile: Dockerfile
     container_name: agent
+    restart: unless-stopped
     env_file:
       - ./_container_data/.env
     ports:
@@ -110,25 +70,30 @@ services:
     depends_on:
       db:
         condition: service_healthy
-      db_init:
-        condition: service_completed_successfully
       vector_db:
-        condition: service_started
+        condition: service_healthy
       downloader_general:
-        condition: service_started
+        condition: service_completed_successfully
       downloader_extra:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ./_container_data/config.yaml:/app/config.yaml:ro
       - ./_container_data/database_schema.yaml:/app/database_schema.yaml:ro
       - ./_container_data/_configs:/app/_configs:ro
       - ./_container_data/agent:/app/_container_data
-  
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
   forecaster:
     build:
       context: forecaster
       dockerfile: Dockerfile
     container_name: forecaster
+    restart: unless-stopped
     env_file:
       - ./_container_data/.env
     ports:
@@ -136,15 +101,19 @@ services:
     depends_on:
       db:
         condition: service_healthy
-      db_init:
-        condition: service_completed_successfully
       vector_db:
-        condition: service_started
+        condition: service_healthy
       downloader_general:
-        condition: service_started
+        condition: service_completed_successfully
     volumes:
       - ./_container_data/config.yaml:/app/config.yaml:ro
       - ./_container_data/forecaster:/app/_container_data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8001/health', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
     # remove `deploy` part if no GPU available
     deploy:
       resources:
@@ -159,6 +128,7 @@ services:
       context: clustering
       dockerfile: Dockerfile
     container_name: clustering
+    restart: unless-stopped
     env_file:
       - ./_container_data/.env
     ports:
@@ -166,21 +136,26 @@ services:
     depends_on:
       db:
         condition: service_healthy
-      db_init:
-        condition: service_completed_successfully
       vector_db:
-        condition: service_started
+        condition: service_healthy
       downloader_general:
-        condition: service_started
+        condition: service_completed_successfully
     volumes:
       - ./_container_data/config.yaml:/app/config.yaml:ro
       - ./_container_data/clustering:/app/_container_data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8002/health', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
 
   downloader_extra:
     build:
       context: downloader_extra
       dockerfile: Dockerfile
     container_name: downloader_extra
+    restart: unless-stopped
     env_file:
       - ./_container_data/.env
     ports:
@@ -188,21 +163,26 @@ services:
     depends_on:
       db:
         condition: service_healthy
-      db_init:
-        condition: service_completed_successfully
       vector_db:
-        condition: service_started
+        condition: service_healthy
       downloader_general:
-        condition: service_started
+        condition: service_completed_successfully
     volumes:
       - ./_container_data/config.yaml:/app/config.yaml:ro
       - ./_container_data/downloader_extra:/app/_container_data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8003/health', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
 
   python_sandbox:
     build:
       context: python_sandbox
       dockerfile: Dockerfile
     container_name: python_sandbox
+    restart: unless-stopped
     env_file:
       - ./_container_data/.env
     ports:
@@ -210,15 +190,63 @@ services:
     depends_on:
       db:
         condition: service_healthy
-      db_init:
-        condition: service_completed_successfully
       vector_db:
-        condition: service_started
+        condition: service_healthy
       downloader_general:
-        condition: service_started
+        condition: service_completed_successfully
     volumes:
       - ./_container_data/config.yaml:/app/config.yaml:ro
       - ./_container_data/python_sandbox:/app/_container_data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8004/health', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  app:
+    build:
+      context: app
+      dockerfile: Dockerfile
+    container_name: app
+    restart: unless-stopped
+    env_file:
+      - ./_container_data/.env
+    ports:
+      - 8501:8501
+    depends_on:
+      db:
+        condition: service_healthy
+      vector_db:
+        condition: service_healthy
+      agent:
+        condition: service_healthy
+      forecaster:
+        condition: service_healthy
+      clustering:
+        condition: service_healthy
+      python_sandbox:
+        condition: service_healthy
+      downloader_general:
+        condition: service_completed_successfully
+      downloader_extra:
+        condition: service_healthy
+    volumes:
+      - ./_container_data/config.yaml:/app/config.yaml:ro
+      - ./_container_data/themes.yaml:/app/themes.yaml
+      - ./_container_data/_configs:/app/_configs
+      - ./_container_data/app:/app/_container_data
+      # Read-only docker socket so the Monitoring page can read container stats.
+      # The app process inside the container runs as root, so it can talk to
+      # the socket directly. Remove this mount if you don't want the dashboard
+      # to introspect the host's containers.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8501/_stcore/health', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
 
 networks:
   default:
