@@ -117,13 +117,13 @@ services:
       retries: 10
       start_period: 60s
     # remove `deploy` part if no GPU available
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: all
-    #           capabilities: [gpu]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]
 
   clustering:
     build:
