@@ -29,7 +29,7 @@ load_dotenv(ENV_FILE_PATH)
 _PG = CONFIG.get("postgres", {})
 SQL_URL = (
     f"postgresql://"
-    f"{os.getenv('POSTGRES_USERNAME')}:{os.getenv('POSTGRES_PASSWORD')}"
+    f"{os.getenv('POSTGRES_LLM_USER')}:{os.getenv('POSTGRES_LLM_PASSWORD')}"
     f"@{_PG.get('host')}:{_PG.get('port')}/{_PG.get('database')}"
 )
 POSTGRES_TARGET = f"{_PG.get('host')}:{_PG.get('port')}"

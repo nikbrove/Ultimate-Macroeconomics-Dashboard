@@ -9,11 +9,11 @@ Runs on every `downloader_general` startup, so rotating
 extra container, and a fresh deployment / upgrade re-applies the grants in case
 new tables were added since the last bootstrap.
 
-The app superuser (``POSTGRES_USERNAME``) is bootstrapped by the postgres
-entrypoint script (``init-user.sh``) on first volume init and is the role we
-connect as here — so it never needs upserting from this code, and ``ALTER
-DEFAULT PRIVILEGES FOR ROLE <superuser>`` correctly targets the role that
-later creates the World Bank + Yahoo tables.
+The app superuser (``POSTGRES_USER``) is created natively by the
+``postgres:18`` image at first volume init and is the role we connect as
+here — so it never needs upserting from this code, and ``ALTER DEFAULT
+PRIVILEGES FOR ROLE <superuser>`` correctly targets the role that later
+creates the World Bank + Yahoo tables.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ def ensure_llm_role(sql_uri: str, llm_username: str, llm_password: str) -> None:
     """
     if not llm_username or not llm_password:
         logger.warning(
-            "Skipping LLM role bootstrap: POSTGRES_LLM_USERNAME / "
+            "Skipping LLM role bootstrap: POSTGRES_LLM_USER / "
             "POSTGRES_LLM_PASSWORD not set."
         )
         return

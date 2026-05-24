@@ -125,7 +125,7 @@ def main() -> None:
 
     load_dotenv(env_file)
     superuser_uri = _get_sql_config(
-        username=os.getenv("POSTGRES_USERNAME", ""),
+        username=os.getenv("POSTGRES_USER", ""),
         password=os.getenv("POSTGRES_PASSWORD", ""),
         host=str(postgres_host),
         port=int(postgres_port),
@@ -134,7 +134,7 @@ def main() -> None:
     try:
         ensure_llm_role(
             sql_uri=superuser_uri,
-            llm_username=os.getenv("POSTGRES_LLM_USERNAME", ""),
+            llm_username=os.getenv("POSTGRES_LLM_USER", ""),
             llm_password=os.getenv("POSTGRES_LLM_PASSWORD", ""),
         )
     except Exception:

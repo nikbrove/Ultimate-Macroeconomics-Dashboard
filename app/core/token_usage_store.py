@@ -68,7 +68,7 @@ def _sql_uri() -> str:
     load_dotenv(ENV_FILE_PATH)
     return (
         f"postgresql+psycopg2://"
-        f"{os.getenv('POSTGRES_USERNAME')}:{os.getenv('POSTGRES_PASSWORD')}"
+        f"{os.getenv('POSTGRES_USER')}:{os.getenv('POSTGRES_PASSWORD')}"
         f"@{pg.get('host')}:{pg.get('port')}/{pg.get('database')}"
     )
 

@@ -98,7 +98,7 @@ class YahooDownloader(BaseYahooDownloader):
 
     def _initialize_connections(self, host: str, port: int, db: str) -> bool:
         load_dotenv(self.env_path)
-        username = os.getenv("POSTGRES_USERNAME")
+        username = os.getenv("POSTGRES_USER")
         password = os.getenv("POSTGRES_PASSWORD")
 
         self.sql_uri = _get_sql_config(

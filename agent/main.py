@@ -60,7 +60,7 @@ QDRANT_URL = f"http://{CONFIG.get('qdrant', {}).get('host')}:{CONFIG.get('qdrant
 QDRANT_API_KEY = os.getenv("QDRANT__SERVICE__API_KEY", "")
 POSTGRES_DATABASE_URI = (
     f"postgresql+psycopg2://"
-    f"{os.getenv('POSTGRES_LLM_USERNAME')}:{os.getenv('POSTGRES_LLM_PASSWORD')}"
+    f"{os.getenv('POSTGRES_LLM_USER')}:{os.getenv('POSTGRES_LLM_PASSWORD')}"
     f"@{CONFIG.get('postgres', {}).get('host')}:{CONFIG.get('postgres', {}).get('port')}"
     f"/{CONFIG.get('postgres', {}).get('database')}"
 )

@@ -41,9 +41,10 @@ Open <http://localhost:8501>. First boot does a one-shot ingestion (~1–2h) tha
 
 | Variable                   | Used by                       | Purpose                                                                |
 | -------------------------- | ----------------------------- | ---------------------------------------------------------------------- |
-| `POSTGRES_USERNAME`        | `db`, `downloader_general`, `app` | Postgres superuser created on first boot.                          |
+| `POSTGRES_USER`            | `db`, `downloader_general`, `downloader_extra`, `app` | Postgres superuser created natively by the `postgres:18` image on first boot. |
 | `POSTGRES_PASSWORD`        | same                          | Password for the superuser.                                            |
-| `POSTGRES_LLM_USERNAME`    | `downloader_general`, `agent` | Read-only role used by the AI analyst to query the database.           |
+| `POSTGRES_DB`              | `db`                          | Default database created on first boot (typically `postgres`).         |
+| `POSTGRES_LLM_USER`        | `downloader_general`, `agent`, `app` | Read-only role used by the AI analyst and the dashboard's bulk reads to query the database. |
 | `POSTGRES_LLM_PASSWORD`    | same                          | Password for the read-only role (rotatable; takes effect on next boot).|
 | `QDRANT__SERVICE__API_KEY` | `vector_db`, `agent`, `app`   | Bearer token protecting the Qdrant HTTP API.                           |
 | `OPENAI_API_KEY`           | `agent`                       | API key for the LLM/embedding provider in `config.yaml`.               |

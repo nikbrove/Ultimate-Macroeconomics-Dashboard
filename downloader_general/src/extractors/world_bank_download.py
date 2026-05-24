@@ -81,7 +81,7 @@ class WorldBankDownloader(BaseWorldBankDownloader):
     def _initialize_connections(self, host: str, port: int, db: str) -> bool:
         load_dotenv(self.env_path)
         username, password = (
-            os.getenv("POSTGRES_USERNAME"),
+            os.getenv("POSTGRES_USER"),
             os.getenv("POSTGRES_PASSWORD"),
         )
         sql_config = _get_sql_config(
