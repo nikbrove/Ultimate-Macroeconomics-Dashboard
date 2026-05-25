@@ -14,7 +14,13 @@ class ProphetForecaster(BaseForecaster):
         """Forward to base constructor; Prophet's own state lives per-call."""
         super().__init__()
 
-    def predict(self, df: pl.DataFrame, n_predict: int, alpha: float) -> pl.DataFrame:
+    def predict(
+        self,
+        df: pl.DataFrame,
+        n_predict: int,
+        alpha: float,
+        **kwargs,
+    ) -> pl.DataFrame:
         """Fit a Prophet model on ``df`` and return ``n_predict`` future points.
 
         Args:

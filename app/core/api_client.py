@@ -83,6 +83,7 @@ def forecast_timeseries(
     n_predict: int,
     alpha: float = 0.05,
     model_type: str = "prophet",
+    model_params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Call ``POST /predict`` on the forecaster service.
 
@@ -93,7 +94,11 @@ def forecast_timeseries(
         n_prev: Maximum number of past points to feed the model.
         n_predict: Number of forecast steps to emit.
         alpha: Confidence level alpha (e.g. ``0.05`` → 95% CI).
-        model_type: ``"prophet"`` / ``"arima"`` / ``"chronos"``.
+        model_type: One of ``"prophet"``, ``"chronos"``, ``"auto_arima"``,
+            ``"arima"``, ``"sarima"``, ``"moving_average"``, ``"xgboost"``.
+        model_params: Model-specific hyperparameters (``p``/``d``/``q`` for
+            ARIMA, ``window`` for MA, ``lags`` for XGBoost, …). Unknown keys
+            are ignored by the wrapper that doesn't need them.
 
     Returns:
         Raw JSON dict with at least a ``forecast`` key (list of points).
@@ -109,6 +114,7 @@ def forecast_timeseries(
         "n_prev": n_prev,
         "n_predict": n_predict,
         "alpha": alpha,
+        "model_params": model_params or {},
     }
     try:
         log_http_request(
@@ -251,25 +257,63 @@ def cluster_dataframe(
     random_state: int = 42,
     eps: float = 0.5,
     min_samples: int = 5,
+    bandwidth: float | None = None,
+    hdbscan_min_cluster_size: int = 5,
+    hdbscan_min_samples: int | None = None,
+    spectral_n_clusters: int = 4,
+    spectral_affinity: str = "rbf",
+    spectral_n_neighbors: int = 10,
+    spectral_gamma: float = 1.0,
+    hierarchical_n_clusters: int = 4,
+    hierarchical_linkage: str = "ward",
     reduction_method: str = "tsne",
+    output_dim: int = 2,
+    umap_n_neighbors: int = 15,
+    umap_min_dist: float = 0.1,
+    kpca_kernel: str = "rbf",
+    kpca_gamma: float | None = None,
+    kpca_degree: int = 3,
+    kpca_coef0: float = 1.0,
     base_url: str | None = None,
 ) -> dict[str, Any]:
     """Call ``POST /cluster`` on the clustering service.
 
     Args:
         dataframe: Row-oriented payload (one dict per row).
-        method: ``"kmeans"`` or ``"dbscan"``.
+        method: One of ``kmeans``, ``dbscan``, ``meanshift``, ``hdbscan``,
+            ``spectral``, ``hierarchical``.
         feature_columns: Numeric columns to feed the algorithm.
         k: Number of clusters for KMeans.
         n_init: Number of KMeans initialisations.
         random_state: Seed for reproducibility.
         eps: DBSCAN neighbourhood radius.
         min_samples: DBSCAN minimum cluster size.
-        reduction_method: ``"tsne"`` or ``"pca"`` for the 2-D projection.
+        bandwidth: Mean-Shift bandwidth; ``None`` triggers sklearn's
+            ``estimate_bandwidth`` helper inside ``MeanShift``.
+        hdbscan_min_cluster_size: HDBSCAN min cluster size.
+        hdbscan_min_samples: HDBSCAN sample density threshold;
+            ``None`` reuses ``min_cluster_size``.
+        spectral_n_clusters: Spectral cluster count.
+        spectral_affinity: ``"rbf"`` or ``"nearest_neighbors"``.
+        spectral_n_neighbors: Spectral KNN neighbourhood size (used when
+            affinity is ``nearest_neighbors``).
+        spectral_gamma: Spectral kernel coefficient (used when affinity is
+            ``rbf``).
+        hierarchical_n_clusters: Agglomerative cluster count.
+        hierarchical_linkage: ``ward`` / ``complete`` / ``average`` / ``single``.
+        reduction_method: ``tsne`` / ``pca`` / ``umap`` / ``kpca`` / ``none``.
+        output_dim: ``2`` or ``3`` — dimensionality of the visualisation.
+        umap_n_neighbors: UMAP neighbourhood size.
+        umap_min_dist: UMAP minimum-distance parameter.
+        kpca_kernel: Kernel for Kernel-PCA.
+        kpca_gamma: Kernel coefficient (``rbf`` / ``poly`` / ``sigmoid``);
+            ``None`` lets sklearn pick.
+        kpca_degree: Polynomial degree for the ``poly`` kernel.
+        kpca_coef0: Independent term for ``poly`` / ``sigmoid``.
         base_url: Clustering service URL (or ``None`` for the default).
 
     Returns:
-        Raw JSON dict with cluster labels and 2-D projection coordinates.
+        Raw JSON dict with cluster labels and 2-D/3-D projection coordinates.
 
     Raises:
         RuntimeError: When the service returns a non-2xx response.
@@ -284,7 +328,23 @@ def cluster_dataframe(
         "random_state": random_state,
         "eps": eps,
         "min_samples": min_samples,
+        "bandwidth": bandwidth,
+        "hdbscan_min_cluster_size": hdbscan_min_cluster_size,
+        "hdbscan_min_samples": hdbscan_min_samples,
+        "spectral_n_clusters": spectral_n_clusters,
+        "spectral_affinity": spectral_affinity,
+        "spectral_n_neighbors": spectral_n_neighbors,
+        "spectral_gamma": spectral_gamma,
+        "hierarchical_n_clusters": hierarchical_n_clusters,
+        "hierarchical_linkage": hierarchical_linkage,
         "reduction_method": reduction_method,
+        "output_dim": output_dim,
+        "umap_n_neighbors": umap_n_neighbors,
+        "umap_min_dist": umap_min_dist,
+        "kpca_kernel": kpca_kernel,
+        "kpca_gamma": kpca_gamma,
+        "kpca_degree": kpca_degree,
+        "kpca_coef0": kpca_coef0,
     }
     try:
         log_http_request(

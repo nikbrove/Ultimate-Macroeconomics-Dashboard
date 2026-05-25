@@ -1,18 +1,28 @@
 """Pydantic request/response schemas for the forecasting FastAPI service."""
 
 import math
-from typing import List, Literal
+from typing import Any, Dict, List, Literal
 
 from pydantic import BaseModel, Field, field_validator
+
+ModelType = Literal[
+    "prophet",
+    "chronos",
+    "auto_arima",
+    "arima",
+    "sarima",
+    "moving_average",
+    "xgboost",
+]
 
 
 class ForecastRequest(BaseModel):
     """Body accepted by ``POST /predict``.
 
     Args:
-        model_type: Which underlying model to use (``prophet``, ``chronos``,
-            ``arima``). Models can be disabled via ``config.yaml`` toggles;
-            requesting a disabled model yields a 400.
+        model_type: Which underlying model to use. Models can be disabled
+            via ``config.yaml`` toggles; requesting a disabled model yields
+            a 400.
         dates: ISO timestamps for the historical points (aligned to ``values``).
         values: Historical observations; must be the same length as ``dates``
             and contain only finite numbers.
@@ -20,11 +30,12 @@ class ForecastRequest(BaseModel):
             (truncates ``dates`` / ``values`` if smaller than their length).
         n_predict: How many future points to produce.
         alpha: Significance level for confidence intervals (e.g. ``0.05`` -> 95%).
+        model_params: Optional model-specific hyperparameters forwarded to
+            the wrapper's ``predict`` call. Unknown keys are ignored by the
+            individual models, so callers can pass a flat dict.
     """
 
-    model_type: Literal["prophet", "chronos", "arima"] = Field(
-        default="prophet", description="Choose the forecasting model."
-    )
+    model_type: ModelType = Field(default="prophet", description="Choose the forecasting model.")
 
     dates: List[str] = Field(..., description="Timestamps for the historical data (ISO format).")
     values: List[float] = Field(..., description="Historical time series values.")
@@ -36,6 +47,10 @@ class ForecastRequest(BaseModel):
         ge=0.01,
         le=0.2,
         description="Significance level for CI",
+    )
+    model_params: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Model-specific hyperparameters (e.g. p/d/q for arima, window for MA).",
     )
 
     @field_validator("values")

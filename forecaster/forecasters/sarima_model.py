@@ -1,18 +1,19 @@
-"""Manual-order ARIMA forecaster using ``statsmodels.tsa.arima.model.ARIMA``."""
+"""SARIMA forecaster using ``statsmodels.tsa.statespace.sarimax`` with manual orders."""
 
 import numpy as np
 import pandas as pd
 import polars as pl
-from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.statespace.sarimax import SARIMAX
 
 from .core.base import BaseForecaster, resolve_forecast_frequency
 
 
-class ArimaForecaster(BaseForecaster):
-    """ARIMA wrapper that takes ``(p, d, q)`` from the request (refits per call).
+class SarimaForecaster(BaseForecaster):
+    """SARIMA wrapper that takes both the non-seasonal and seasonal orders.
 
-    The companion :class:`AutoArimaForecaster` does the same job with
-    ``pmdarima.auto_arima`` choosing the orders automatically.
+    The fit relaxes the stationarity/invertibility checks so user-supplied
+    orders that lie outside the strict region still produce a forecast
+    (state-space filtering remains valid).
     """
 
     def __init__(self):
@@ -28,25 +29,41 @@ class ArimaForecaster(BaseForecaster):
         p: int = 1,
         d: int = 1,
         q: int = 1,
+        P: int = 0,
+        D: int = 0,
+        Q: int = 0,
+        s: int = 12,
         **kwargs,
     ) -> pl.DataFrame:
-        """Fit ``ARIMA(p, d, q)`` on ``df.y`` and return ``n_predict`` future points.
+        """Fit ``SARIMA((p, d, q), (P, D, Q, s))`` and return ``n_predict`` future points.
 
         Args:
             df: Two-column ``(ds, y)`` Polars frame sorted ascending by ``ds``.
             n_predict: Forecast horizon in points.
             alpha: Significance level for the confidence interval.
-            p: AR order.
-            d: Integration (difference) order.
-            q: MA order.
+            p: Non-seasonal AR order.
+            d: Non-seasonal integration order.
+            q: Non-seasonal MA order.
+            P: Seasonal AR order.
+            D: Seasonal integration order.
+            Q: Seasonal MA order.
+            s: Seasonal period.
 
         Returns:
             Polars frame with ``ds``, ``yhat``, ``yhat_lower``, ``yhat_upper``.
         """
         y = df["y"].to_numpy().astype(float)
         order = (int(p), int(d), int(q))
+        seasonal_order = (int(P), int(D), int(Q), int(s))
 
-        model = ARIMA(y, order=order).fit()
+        model = SARIMAX(
+            y,
+            order=order,
+            seasonal_order=seasonal_order,
+            enforce_stationarity=False,
+            enforce_invertibility=False,
+        ).fit(disp=False)
+
         forecast = model.get_forecast(steps=n_predict)
         yhat = np.asarray(forecast.predicted_mean, dtype=float)
         conf = np.asarray(forecast.conf_int(alpha=alpha), dtype=float)

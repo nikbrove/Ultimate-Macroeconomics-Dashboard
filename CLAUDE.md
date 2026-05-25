@@ -37,7 +37,7 @@ First boot requires `_container_data/.env` (copy from `_container_data/.env.exam
 
 The bootstrap step runs on **every** `downloader_general` container start (cheap, idempotent), so rotating `POSTGRES_LLM_PASSWORD` or adding new tables in a future release takes effect on the next `docker compose up -d downloader_general` without wiping volumes. Only the downloads themselves are one-shot, gated by `_container_data/downloader_general/.download_completed`.
 
-If the host has no NVIDIA GPU, remove the `deploy:` block from the `forecaster` service in `docker-compose.yaml` (the `chronos` model will be skipped; `pmdarima` and `prophet` still work).
+If the host has no NVIDIA GPU, remove the `deploy:` block from the `forecaster` service in `docker-compose.yaml` (the `chronos` model will be skipped; every other model — `auto_arima`, manual `arima`, `sarima`, `prophet`, `moving_average`, `xgboost` — runs CPU-only).
 
 ## Architecture
 
@@ -47,10 +47,10 @@ If the host has no NVIDIA GPU, remove the `deploy:` block from the `forecaster` 
 | -------------------- | ---- | ------------------------------------------------------------------------------------- |
 | `db`                 | 5432 | Postgres 18 — World Bank + Yahoo Finance tabular data                                 |
 | `vector_db`          | 6333 | Qdrant — news article embeddings                                                      |
-| `downloader_general` | —    | One-shot: bootstraps the read-only LLM role, clones `Webhose/free-news-datasets`, fetches WB + Yahoo, populates both DBs |
+| `downloader_general` | —    | One-shot: bootstraps LLM role, ingests WB + Yahoo + news, populates both DBs          |
 | `app`                | 8501 | Streamlit dashboard (entry point: `app/app.py`)                                       |
 | `agent`              | 8000 | FastAPI — LangGraph multi-agent AI analyst                                            |
-| `forecaster`         | 8001 | FastAPI — `pmdarima` / `prophet` / `chronos` time-series forecasting                  |
+| `forecaster`         | 8001 | FastAPI — forecasting (ARIMA family, Prophet, Chronos, MA, XGBoost)                   |
 | `clustering`         | 8002 | FastAPI — KMeans / DBSCAN                                                             |
 | `downloader_extra`   | 8003 | FastAPI — on-demand World Bank indicator ingestion (called by the agent)              |
 | `python_sandbox`     | 8004 | FastAPI — isolated executor for LLM-generated Plotly/Polars code                      |
@@ -64,12 +64,13 @@ Inside the Compose network, services address each other by container name and th
 Important: `docker-compose.yaml` duplicates the ports and bind-mount paths declared in `config.yaml`. Changing a port or path in one file requires changing it in the other. The two files are not auto-synced.
 
 Other config files in `_container_data/`:
+
 - `.env` — secrets (Postgres creds, Qdrant API key, `OPENAI_API_KEY`). Never commit; gitignored.
 - `database_schema.yaml` — column-level documentation of Postgres tables; mounted into `agent` so the SQL worker can ground its queries.
 - `_configs/world_bank_download_config.json` — list of WB indicators grouped by dashboard page. Append here to add indicators on next clean boot; or add at runtime via the AI analyst (it calls `downloader_extra`).
 - `_configs/news_download_config.json` — news topics for the RAG corpus.
 - `_configs/yahoo_download_config.json` — Yahoo Finance tickers.
-- `themes.yaml` — colour palettes. `active:` key selects one; bundled themes are `dark`, `dark-blue`, `light-green`. Drives both the registered Plotly template (`"app"`) and Streamlit chrome. **Deploy-time only** — the runtime theme picker was removed in v0.6.
+- `themes.yaml` — colour palettes. `active:` key selects one; bundled themes are `dark`, `dark-blue`, `light-green`. Drives both the registered Plotly template (`"app"`) and Streamlit chrome. **Deploy-time only** — the runtime theme picker was removed in v0.6. Adding a custom theme means covering every semantic token used in code (`positive`, `negative`, `reference_line`, `map_coastline`, `sector_*`, `diverging_*`, `sequential_*`, `card_title_color`, `confidence_band_alpha`, `selected_marker`, `wordcloud_background`, `wordcloud_colormap`) — `get_color` raises `KeyError` on a missing token, no silent fallback.
 - `app/.streamlit/config.toml` — Streamlit's own theme/server config. Mirror of `themes.yaml` for the chrome side; edit `server.address = "0.0.0.0"` to expose the local dev build on the LAN.
 
 ### `app` (Streamlit)
@@ -106,6 +107,24 @@ Per-LLM-call token accounting is attached via `UsageTracker` (`agent/agent/usage
 
 External backend calls (sandbox, downloader_extra) use one shared `httpx.AsyncClient` from `agent.tools._get_httpx_client()` (closed in the FastAPI shutdown hook); the rendered database-schema text is `functools.lru_cache`d so it isn't re-serialised on every SQL step.
 
+### `forecaster`
+
+`forecaster/main.py` exposes a single `POST /predict` endpoint backed by seven model wrappers under `forecaster/forecasters/`:
+
+| model id         | wrapper                          | notes                                                            |
+| ---------------- | -------------------------------- | ---------------------------------------------------------------- |
+| `auto_arima`     | `AutoArimaForecaster` (pmdarima) | non-seasonal `pmdarima.auto_arima`; refits per request           |
+| `arima`          | `ArimaForecaster` (statsmodels)  | manual `(p, d, q)` from `model_params`                           |
+| `sarima`         | `SarimaForecaster` (SARIMAX)     | manual `(p, d, q)` + `(P, D, Q, s)`; relaxed stationarity checks |
+| `prophet`        | `ProphetForecaster`              | Facebook Prophet; `interval_width = 1 - alpha`                   |
+| `chronos`        | `ChronosForecaster`              | Amazon Chronos T5 sample-based; preloaded at startup             |
+| `moving_average` | `MovingAverageForecaster`        | flat-mean baseline; residual sd × √horizon CI                    |
+| `xgboost`        | `XgboostForecaster`              | lag + rolling features, recursive multi-step                     |
+
+Per-model hyperparameters travel in a single `model_params: dict[str, Any]` field on `ForecastRequest`; each wrapper's `predict` signature pulls the keys it needs by name (`p`/`d`/`q`, `window`, `lags`, …) and `**kwargs` swallows the rest. Adding a new model means: new file under `forecaster/forecasters/`, lazy-import branch in `_get_forecaster`, the id added to the `ModelType` literal in `forecaster/schemas.py`, the GraphBox UI in `app/core/plotting.py` (model dropdown option + a branch in `_render_model_param_inputs`), and a smoke test in `forecaster/tests/test_arima_smoke.py`.
+
+`ARIMA_AVAILABLE` / `PROPHET_AVAILABLE` / `CHRONOS_AVAILABLE` toggles in `config.yaml` gate the three heavy-dep families. `auto_arima` / `arima` / `sarima` all ride on `ARIMA_AVAILABLE`. `moving_average` and `xgboost` are always available.
+
 ### Data ingestion
 
 `downloader_general/src/` is split into `core/` (orchestration, schema validation in `utils/schema.py`), `extractors/` (one module per source: `world_bank`, `yahoo`, `github` for the news repo), and `utils/`. It's a one-shot job — its container exits after success. Re-running it from scratch requires removing the `_container_data/downloader_general/.download_completed` marker (gitignored) and the persistent volumes (`postgres_data`, `qdrant_data`).
@@ -120,3 +139,5 @@ For incremental WB indicator additions during a live stack, the agent's `downloa
 - Every backend HTTP endpoint should have a typed wrapper in `app/core/api_client.py` — don't bypass it from pages.
 - Two Postgres roles: the superuser `POSTGRES_USER` (created natively by the `postgres:18` image at first volume init) is used by `downloader_general` / `downloader_extra` for ingestion writes and by `app/core/token_usage_store.py` for `token_usage` inserts; the read-only `POSTGRES_LLM_USER` is used by the `agent` (SQL worker) AND by the `app` for all `connectorx` page reads. `db_bootstrap.ensure_llm_role` grants the read-only role `USAGE` on `public` plus `SELECT` on all existing and future tables (via `ALTER DEFAULT PRIVILEGES`) — don't grant it anything more.
 - DB access: the `app` keeps `connectorx` for bulk Polars reads; the `agent`'s `sql_agent` worker keeps raw `text()` because the LLM generates dynamic SQL. Everywhere else uses SQLAlchemy ORM (`select`/`delete`/`Session`) on `Mapped` models — don't sprinkle new `text()` calls.
+- Postgres database name resolution: every client (`app/core/postgres_client.py`, `agent/main.py`, `downloader_extra/main.py`, `downloader_general/main.py`) reads `os.getenv("POSTGRES_DB") or config["postgres"]["database"]`. `POSTGRES_DB` in `.env` is the source of truth; `config.yaml`'s `postgres.database` is the fallback when the env var is unset. The postgres image itself only honours `POSTGRES_DB` at first volume init — changing the value on a populated volume requires re-creating the DB or wiping the volume.
+- News page embedding panels (`app/pages/15_news.py: _render_embedding_map` and `_render_distance_histogram`) run only when their `st.form_submit_button` is clicked and cache the result in `st.session_state` so picking a different article re-draws the highlight on the cached projection without re-clustering. The scatter highlights the selected article using the `selected_marker` theme token; add that token to any custom theme before shipping it.

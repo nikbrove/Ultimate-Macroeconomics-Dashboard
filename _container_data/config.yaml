@@ -28,7 +28,6 @@ services:
 postgres:
   host: db
   port: 5432
-  database: postgres
 qdrant:
   host: vector_db
   port: 6333

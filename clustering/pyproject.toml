@@ -1,7 +1,7 @@
 [project]
 name = "umd-clustering"
 version = "0.8.0"
-description = "FastAPI service exposing KMeans and DBSCAN clustering."
+description = "FastAPI service exposing tabular clustering (KMeans, DBSCAN, Mean-Shift, HDBSCAN, Spectral, Hierarchical) with 2D/3D projection (t-SNE, PCA, UMAP, Kernel PCA)."
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "annotated-types==0.7.0",
@@ -23,6 +23,7 @@ dependencies = [
     "threadpoolctl==3.6.0",
     "typing-extensions==4.15.0",
     "typing-inspection==0.4.2",
+    "umap-learn==0.5.12",
     "uvicorn==0.42.0",
 ]
 

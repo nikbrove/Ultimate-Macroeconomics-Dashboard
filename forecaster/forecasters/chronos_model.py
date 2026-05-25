@@ -36,7 +36,13 @@ class ChronosForecaster(BaseForecaster):
                 torch_dtype=dtype,
             )
 
-    def predict(self, df: pl.DataFrame, n_predict: int, alpha: float) -> pl.DataFrame:
+    def predict(
+        self,
+        df: pl.DataFrame,
+        n_predict: int,
+        alpha: float,
+        **kwargs,
+    ) -> pl.DataFrame:
         """Run Chronos sampling and produce a median forecast + alpha CI.
 
         Args:
