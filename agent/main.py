@@ -62,7 +62,7 @@ POSTGRES_DATABASE_URI = (
     f"postgresql+psycopg2://"
     f"{os.getenv('POSTGRES_LLM_USER')}:{os.getenv('POSTGRES_LLM_PASSWORD')}"
     f"@{CONFIG.get('postgres', {}).get('host')}:{CONFIG.get('postgres', {}).get('port')}"
-    f"/{CONFIG.get('postgres', {}).get('database')}"
+    f"/{os.getenv('POSTGRES_DB') or CONFIG.get('postgres', {}).get('database')}"
 )
 OPENAI_EMBEDDING_MODEL = SHARED_CFG.get("openai_embedding_model", "text-embedding-3-small")
 
@@ -234,28 +234,28 @@ async def interpret_plot(request: PlotInterpretationRequest):
 
         if request.mode == "no_hallucinations":
             system_prompt = (
-                "You are a chart-reading assistant. Describe only what is visible "
-                "in the plot image. Focus on factual line behaviour over time: "
-                "direction, turning points, relative volatility, plateaus, spikes, "
-                "and comparisons between lines. Do not speculate about causes."
+                "Read the chart. Only describe what is visible — direction, "
+                "turning points, spikes, plateaus, line comparisons. No causes, "
+                "no speculation. Reply in 3 short bullets, ~40 words total."
             )
             temperature = 0.0
         else:
             system_prompt = (
-                "You are a macro-financial chart analyst. First summarise what the "
-                "plot shows, then provide plausible interpretations. Clearly "
-                "separate observations from hypotheses."
+                "Macro-financial chart analyst. One bullet of observations, "
+                "one of likely drivers. Mark hypotheses with 'likely'. "
+                "Max 60 words total."
             )
             temperature = 0.5
 
-        user_text = "Interpret this plot image."
+        user_text = "Describe this chart."
         if request.chart_context.strip():
-            user_text += f"\nContext: {request.chart_context.strip()}"
+            user_text += f" Context: {request.chart_context.strip()}"
 
         completion = await asyncio.to_thread(
             client.chat.completions.create,
             model=AGENT_MODEL,
             temperature=temperature,
+            max_tokens=200 if request.mode == "no_hallucinations" else 260,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {

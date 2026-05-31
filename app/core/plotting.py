@@ -79,6 +79,7 @@ def build_line_plot(
     forecast_lower_col: Optional[str] = None,
     forecast_upper_col: Optional[str] = None,
     hover_context: Optional[str] = None,
+    show_markers: bool = False,
 ) -> go.Figure:
     """Build a Plotly line chart for one or more time series.
 
@@ -95,11 +96,14 @@ def build_line_plot(
         forecast_upper_col: Column name of the upper CI bound in ``forecast_df``.
         hover_context: Optional descriptive string injected into the unified
             hover title — used to surface units/source.
+        show_markers: When ``True``, every historical and forecast point is
+            rendered with a circle marker on top of the line.
 
     Returns:
         Themed ``go.Figure`` ready to pass to ``st.plotly_chart``.
     """
     fig = go.Figure()
+    line_mode = "lines+markers" if show_markers else "lines"
 
     def _rgba(color: str, alpha: float) -> str:
         """Convert a ``#rrggbb`` hex colour into ``rgba(...)`` with given alpha."""
@@ -166,6 +170,50 @@ def build_line_plot(
     palette = get_colorway()
     series_colors = {name: palette[index % len(palette)] for index, name in enumerate(series_names)}
 
+    last_historical_by_series: dict[str, tuple[Any, Any]] = {}
+    if not df.is_empty():
+        if group_col and group_col in df.columns:
+            for (group_val,), group_df in df.partition_by(group_col, as_dict=True).items():
+                prepared = _prepare_line_df(group_df)
+                if prepared.is_empty():
+                    continue
+                last_historical_by_series[str(group_val)] = (
+                    prepared[x_col].to_list()[-1],
+                    prepared[y_col].to_list()[-1],
+                )
+        else:
+            prepared_all = _prepare_line_df(df)
+            if not prepared_all.is_empty():
+                last_historical_by_series["Historical"] = (
+                    prepared_all[x_col].to_list()[-1],
+                    prepared_all[y_col].to_list()[-1],
+                )
+
+    def _add_forecast_connector(
+        series_key: str, trace_color: Optional[str], prepared_forecast: pl.DataFrame
+    ) -> None:
+        """Bridge the last actual point to the first predicted point with a dashed segment.
+
+        The connector carries no confidence band: the CI shading starts at the
+        first forecast point so the join with history reads cleanly.
+        """
+        if prepared_forecast.is_empty() or series_key not in last_historical_by_series:
+            return
+        last_x, last_y = last_historical_by_series[series_key]
+        first_x = prepared_forecast[x_col].to_list()[0]
+        first_y = prepared_forecast[y_col].to_list()[0]
+        fig.add_trace(
+            go.Scatter(
+                x=[last_x, first_x],
+                y=[last_y, first_y],
+                mode="lines",
+                line=dict(color=trace_color, width=2, dash="dash"),
+                legendgroup=series_key,
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
+
     if df.is_empty():
         fig.add_annotation(text="No historical data.", showarrow=False)
         fig.update_layout(title=title)
@@ -180,7 +228,7 @@ def build_line_plot(
                 go.Scatter(
                     x=prepared_group_df[x_col],
                     y=prepared_group_df[y_col],
-                    mode="lines",
+                    mode=line_mode,
                     name=str(group_val),
                     line=dict(color=series_colors.get(str(group_val))),
                     legendgroup=str(group_val),
@@ -197,7 +245,7 @@ def build_line_plot(
             go.Scatter(
                 x=prepared_df[x_col],
                 y=prepared_df[y_col],
-                mode="lines",
+                mode=line_mode,
                 name="Historical",
                 line=dict(color=series_colors.get("Historical")),
                 legendgroup="Historical",
@@ -247,11 +295,12 @@ def build_line_plot(
                             hoverinfo="skip",
                         )
                     )
+                _add_forecast_connector(series_name, trace_color, prepared_forecast_df)
                 fig.add_trace(
                     go.Scatter(
                         x=prepared_forecast_df[x_col],
                         y=prepared_forecast_df[y_col],
-                        mode="lines",
+                        mode=line_mode,
                         name=f"{series_name} (Forecast)",
                         line=dict(color=trace_color, width=2, dash="dash"),
                         legendgroup=series_name,
@@ -301,11 +350,12 @@ def build_line_plot(
                         hoverinfo="skip",
                     )
                 )
+            _add_forecast_connector("Historical", trace_color, prepared_forecast_df)
             fig.add_trace(
                 go.Scatter(
                     x=prepared_forecast_df[x_col],
                     y=prepared_forecast_df[y_col],
-                    mode="lines",
+                    mode=line_mode,
                     name="Forecast",
                     line=dict(color=trace_color, width=2, dash="dash"),
                     legendgroup="Historical",
@@ -686,6 +736,7 @@ class GraphBox:
         steps: int,
         alpha: float,
         model_type: str,
+        model_params: Optional[dict[str, Any]] = None,
     ) -> pl.DataFrame:
         """Call the forecaster service for each country in scope, concatenated.
 
@@ -694,7 +745,10 @@ class GraphBox:
             lookback: Number of historical points the model is allowed to use.
             steps: Forecast horizon.
             alpha: Confidence-interval alpha (e.g. 0.05 -> 95% CI).
-            model_type: ``"prophet"`` / ``"arima"`` / ``"chronos"``.
+            model_type: One of the model ids from the forecaster's
+                ``Literal``. See :func:`core.api_client.forecast_timeseries`.
+            model_params: Model-specific hyperparameters (forwarded to the
+                forecaster service; unknown keys are ignored downstream).
 
         Returns:
             Concatenated forecast frame across countries, or an empty
@@ -741,6 +795,7 @@ class GraphBox:
                         n_predict=steps,
                         alpha=alpha,
                         model_type=model_type,
+                        model_params=model_params or {},
                     )
                 except Exception as exc:
                     st.warning(f"Forecast service is unavailable: {exc}")
@@ -764,6 +819,7 @@ class GraphBox:
                     n_predict=steps,
                     alpha=alpha,
                     model_type=model_type,
+                    model_params=model_params or {},
                 )
             except Exception as exc:
                 st.warning(f"Forecast service is unavailable: {exc}")
@@ -941,6 +997,80 @@ class GraphBox:
         st.session_state[cache_key] = cached
         return description
 
+    def _render_model_param_inputs(self, selected_model: str) -> dict[str, Any]:
+        """Render the hyperparameter widgets for ``selected_model`` and collect them.
+
+        Each model exposes a small, opinionated set of knobs (e.g. ``(p, d, q)``
+        for ARIMA, ``(P, D, Q, s)`` plus the non-seasonal triple for SARIMA,
+        ``window`` for the moving-average baseline, lag/tree settings for
+        XGBoost). The returned dict is forwarded verbatim to the forecaster
+        service as ``model_params``; models that don't expect a given key just
+        ignore it.
+        """
+        params: dict[str, Any] = {}
+        if selected_model == "arima":
+            params["p"] = int(
+                st.number_input("AR order (p)", 0, 10, 1, key=f"{self.key_prefix}_arima_p")
+            )
+            params["d"] = int(
+                st.number_input("Diff order (d)", 0, 3, 1, key=f"{self.key_prefix}_arima_d")
+            )
+            params["q"] = int(
+                st.number_input("MA order (q)", 0, 10, 1, key=f"{self.key_prefix}_arima_q")
+            )
+        elif selected_model == "sarima":
+            params["p"] = int(
+                st.number_input("AR order (p)", 0, 10, 1, key=f"{self.key_prefix}_sarima_p")
+            )
+            params["d"] = int(
+                st.number_input("Diff order (d)", 0, 3, 1, key=f"{self.key_prefix}_sarima_d")
+            )
+            params["q"] = int(
+                st.number_input("MA order (q)", 0, 10, 1, key=f"{self.key_prefix}_sarima_q")
+            )
+            params["P"] = int(
+                st.number_input("Seasonal AR (P)", 0, 5, 0, key=f"{self.key_prefix}_sarima_P")
+            )
+            params["D"] = int(
+                st.number_input("Seasonal diff (D)", 0, 2, 0, key=f"{self.key_prefix}_sarima_D")
+            )
+            params["Q"] = int(
+                st.number_input("Seasonal MA (Q)", 0, 5, 0, key=f"{self.key_prefix}_sarima_Q")
+            )
+            params["s"] = int(
+                st.number_input(
+                    "Seasonal period (s)", 1, 365, 12, key=f"{self.key_prefix}_sarima_s"
+                )
+            )
+        elif selected_model == "moving_average":
+            params["window"] = int(
+                st.number_input("Window", 1, 100, 5, key=f"{self.key_prefix}_ma_window")
+            )
+        elif selected_model == "xgboost":
+            params["lags"] = int(
+                st.number_input("Lags", 1, 60, 5, key=f"{self.key_prefix}_xgb_lags")
+            )
+            params["n_estimators"] = int(
+                st.number_input(
+                    "Estimators", 50, 1000, 200, step=50, key=f"{self.key_prefix}_xgb_n_estimators"
+                )
+            )
+            params["max_depth"] = int(
+                st.number_input("Max depth", 1, 12, 3, key=f"{self.key_prefix}_xgb_max_depth")
+            )
+            params["learning_rate"] = float(
+                st.number_input(
+                    "Learning rate",
+                    min_value=0.005,
+                    max_value=0.5,
+                    value=0.05,
+                    step=0.005,
+                    format="%.3f",
+                    key=f"{self.key_prefix}_xgb_lr",
+                )
+            )
+        return params
+
     def _render_header_and_settings(
         self,
         defaults: dict[str, Any],
@@ -949,7 +1079,7 @@ class GraphBox:
 
         Mutates nothing on ``self``; the returned dict carries every choice
         the rest of ``render_streamlit_ui`` needs (right_plot, forecast
-        params, distribution params, run-button click).
+        params, distribution params, run-button click, marker toggle).
         """
         settings: dict[str, Any] = dict(defaults)
 
@@ -967,18 +1097,46 @@ class GraphBox:
                     key=f"{self.key_prefix}_right_plot",
                 )
 
+                if settings["right_plot"] == "time trend":
+                    settings["show_markers"] = st.toggle(
+                        "Highlight points",
+                        value=False,
+                        key=f"{self.key_prefix}_show_markers",
+                        help=(
+                            "Adds a circle marker on every historical and forecast point. "
+                            "Off by default."
+                        ),
+                    )
+                else:
+                    settings["show_markers"] = False
+
                 st.divider()
                 if settings["right_plot"] == "time trend":
                     st.markdown("**Time Series Forecasting**")
+                    settings["selected_model"] = st.selectbox(
+                        "Model",
+                        [
+                            "prophet",
+                            "auto_arima",
+                            "arima",
+                            "sarima",
+                            "moving_average",
+                            "xgboost",
+                            "chronos",
+                        ],
+                        index=0,
+                        key=f"{self.key_prefix}_model",
+                        help=(
+                            "auto_arima tunes (p, d, q) automatically; arima/sarima take "
+                            "the orders from the inputs below."
+                        ),
+                    )
                     with st.form(
                         key=f"{self.key_prefix}_forecast_form",
                         border=False,
                     ):
-                        settings["selected_model"] = st.selectbox(
-                            "Model",
-                            ["prophet", "arima", "chronos"],
-                            index=0,
-                            key=f"{self.key_prefix}_model",
+                        settings["model_params"] = self._render_model_param_inputs(
+                            settings["selected_model"],
                         )
                         settings["alpha_value"] = st.slider(
                             "Alpha",
@@ -1080,6 +1238,8 @@ class GraphBox:
                     "points_to_use": 50,
                     "points_to_predict": 10,
                     "run_model_clicked": False,
+                    "show_markers": False,
+                    "model_params": {},
                 },
             )
             right_plot = settings["right_plot"]
@@ -1090,6 +1250,8 @@ class GraphBox:
             points_to_use = settings["points_to_use"]
             points_to_predict = settings["points_to_predict"]
             run_model_clicked = settings["run_model_clicked"]
+            show_markers = bool(settings.get("show_markers", False))
+            model_params: dict[str, Any] = dict(settings.get("model_params") or {})
 
             df_hist_raw = self._fetch_data()
             df_hist_non_null = df_hist_raw.filter(pl.col(schema["y"]).is_not_null())
@@ -1138,6 +1300,7 @@ class GraphBox:
                     "points_to_use": int(points_to_use),
                     "points_to_predict": int(points_to_predict),
                     "countries": tuple(sorted(str(c) for c in self.selected_countries)),
+                    "model_params": tuple(sorted(model_params.items())),
                 }
                 previous_params = st.session_state.get(forecast_params_key)
                 if previous_params != current_forecast_params and not run_model_clicked:
@@ -1151,6 +1314,7 @@ class GraphBox:
                             int(points_to_predict),
                             float(alpha_value),
                             selected_model,
+                            model_params=model_params,
                         )
                     st.session_state[forecast_params_key] = current_forecast_params
                     st.session_state[forecast_data_key] = (
@@ -1236,6 +1400,7 @@ class GraphBox:
                     forecast_lower_col=f"{schema['y']}_lower",
                     forecast_upper_col=f"{schema['y']}_upper",
                     hover_context=hover_context,
+                    show_markers=show_markers,
                 )
             else:
                 distribution_df = df_year

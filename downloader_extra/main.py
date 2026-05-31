@@ -28,10 +28,11 @@ CONFIG = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
 load_dotenv(ENV_FILE_PATH)
 
 _PG = CONFIG.get("postgres", {})
+_PG_DATABASE = os.getenv("POSTGRES_DB") or _PG.get("database")
 SQL_URI = (
     f"postgresql+psycopg2://"
     f"{os.getenv('POSTGRES_USER')}:{os.getenv('POSTGRES_PASSWORD')}"
-    f"@{_PG.get('host')}:{_PG.get('port')}/{_PG.get('database')}"
+    f"@{_PG.get('host')}:{_PG.get('port')}/{_PG_DATABASE}"
 )
 
 

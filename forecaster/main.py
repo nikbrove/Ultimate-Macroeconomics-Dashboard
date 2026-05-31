@@ -1,4 +1,4 @@
-"""FastAPI service exposing pmdarima / Prophet / Chronos time-series forecasting.
+"""FastAPI service exposing the forecasting models.
 
 Heavy ML imports happen lazily inside :func:`_get_forecaster` so the container
 boots fast even when only a subset of models is enabled. Each model is
@@ -33,19 +33,23 @@ CHRONOS_AVAILABLE = bool(FORECASTER_CONFIG.get("CHRONOS_AVAILABLE"))
 CHRONOS_MODEL_NAME = FORECASTER_CONFIG.get("CHRONOS_MODEL")
 CHRONOS_DEFAULT_MODEL_NAME = "amazon/chronos-t5-small"
 
+# `auto_arima`, `arima`, `sarima` share the ARIMA dep stack (pmdarima / statsmodels)
+# so they ride on the same toggle. Moving-average and XGBoost have lightweight
+# deps and stay always-available.
+ARIMA_FAMILY_MODELS = {"auto_arima", "arima", "sarima"}
+
 
 async def _get_forecaster(app: FastAPI, model_type: str) -> BaseForecaster:
     """Return a cached forecaster, lazily importing + constructing under a lock.
 
     Without the lock, two concurrent first-time requests for the same model
-    would each import the heavy ML library (prophet, chronos…) and race on
-    the dict assignment. The lock makes initialization atomic across the
-    asyncio event loop. Heavy fit/predict still runs off-loop via
-    ``run_in_threadpool``.
+    would each import the heavy ML library and race on the dict assignment.
+    The lock makes initialization atomic across the asyncio event loop;
+    heavy fit/predict still runs off-loop via ``run_in_threadpool``.
 
     Args:
         app: FastAPI instance whose ``state.model_cache`` holds the singletons.
-        model_type: ``prophet`` / ``chronos`` / ``arima``.
+        model_type: Model id from :data:`schemas.ModelType`.
 
     Returns:
         A ready-to-use :class:`BaseForecaster` subclass.
@@ -95,23 +99,65 @@ async def _get_forecaster(app: FastAPI, model_type: str) -> BaseForecaster:
             )
             return cache["chronos"]
 
-    if model_type == "arima":
+    if model_type in ARIMA_FAMILY_MODELS:
         if not ARIMA_AVAILABLE:
-            raise HTTPException(status_code=400, detail="Model 'arima' is disabled.")
-        if "arima" in cache:
-            return cache["arima"]
+            raise HTTPException(status_code=400, detail=f"Model '{model_type}' is disabled.")
+        if model_type in cache:
+            return cache[model_type]
         async with lock:
-            if "arima" in cache:
-                return cache["arima"]
+            if model_type in cache:
+                return cache[model_type]
             try:
-                from forecasters.arima_model import ArimaForecaster
+                if model_type == "auto_arima":
+                    from forecasters.auto_arima_model import AutoArimaForecaster
+
+                    cache[model_type] = AutoArimaForecaster()
+                elif model_type == "arima":
+                    from forecasters.arima_model import ArimaForecaster
+
+                    cache[model_type] = ArimaForecaster()
+                else:  # sarima
+                    from forecasters.sarima_model import SarimaForecaster
+
+                    cache[model_type] = SarimaForecaster()
             except Exception as e:
                 raise HTTPException(
                     status_code=500,
-                    detail=f"Failed to initialize ARIMA forecaster: {str(e)}",
+                    detail=f"Failed to initialize {model_type} forecaster: {str(e)}",
                 )
-            cache["arima"] = ArimaForecaster()
-            return cache["arima"]
+            return cache[model_type]
+
+    if model_type == "moving_average":
+        if "moving_average" in cache:
+            return cache["moving_average"]
+        async with lock:
+            if "moving_average" in cache:
+                return cache["moving_average"]
+            try:
+                from forecasters.moving_average_model import MovingAverageForecaster
+            except Exception as e:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to initialize moving-average forecaster: {str(e)}",
+                )
+            cache["moving_average"] = MovingAverageForecaster()
+            return cache["moving_average"]
+
+    if model_type == "xgboost":
+        if "xgboost" in cache:
+            return cache["xgboost"]
+        async with lock:
+            if "xgboost" in cache:
+                return cache["xgboost"]
+            try:
+                from forecasters.xgboost_model import XgboostForecaster
+            except Exception as e:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to initialize XGBoost forecaster: {str(e)}",
+                )
+            cache["xgboost"] = XgboostForecaster()
+            return cache["xgboost"]
 
     raise HTTPException(status_code=400, detail=f"Unknown model type: {model_type}")
 
@@ -122,7 +168,7 @@ async def lifespan(app: FastAPI):
 
     Chronos is eagerly loaded onto RAM/GPU at boot so the first inference
     request doesn't pay the multi-second checkpoint-download + weight-load
-    cost. ARIMA/Prophet stay lazy since they are cheap to construct.
+    cost. Everything else stays lazy since they are cheap to construct.
     """
     app.state.model_cache = {}
     app.state.model_cache_lock = asyncio.Lock()
@@ -133,9 +179,11 @@ async def lifespan(app: FastAPI):
 
             chronos_label = CHRONOS_MODEL_NAME or CHRONOS_DEFAULT_MODEL_NAME
             logger.info("Preloading Chronos pipeline: %s", chronos_label)
-            app.state.model_cache["chronos"] = await run_in_threadpool(
-                ChronosForecaster, CHRONOS_MODEL_NAME
-            ) if CHRONOS_MODEL_NAME else await run_in_threadpool(ChronosForecaster)
+            app.state.model_cache["chronos"] = (
+                await run_in_threadpool(ChronosForecaster, CHRONOS_MODEL_NAME)
+                if CHRONOS_MODEL_NAME
+                else await run_in_threadpool(ChronosForecaster)
+            )
             logger.info("Chronos pipeline ready (%s)", chronos_label)
         except Exception as exc:
             logger.warning("Failed to preload Chronos on startup: %s", exc, exc_info=True)
@@ -145,7 +193,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Time Series Forecasting API",
-    description="A unified API for Prophet, Chronos, and ARIMA forecasting.",
+    description="A unified API for ARIMA / SARIMA / Prophet / Chronos / MA / XGBoost forecasting.",
     lifespan=lifespan,
 )
 
@@ -166,17 +214,20 @@ def health_check() -> dict[str, str]:
 def list_models() -> dict[str, list[str]]:
     """Return the labels of every enabled model.
 
-    Chronos additionally embeds the underlying checkpoint name in parentheses
-    so the dashboard can show which weights are loaded.
+    Chronos additionally embeds the underlying checkpoint name in
+    parentheses so the dashboard can show which weights are loaded.
+    Moving-average and XGBoost are always available because their
+    deps are lightweight.
     """
     available_models: list[str] = []
     if ARIMA_AVAILABLE:
-        available_models.append("arima")
+        available_models.extend(["auto_arima", "arima", "sarima"])
     if PROPHET_AVAILABLE:
         available_models.append("prophet")
     if CHRONOS_AVAILABLE:
         chronos_label = CHRONOS_MODEL_NAME or CHRONOS_DEFAULT_MODEL_NAME
         available_models.append(f"chronos ({chronos_label})")
+    available_models.extend(["moving_average", "xgboost"])
 
     return {"available_models": available_models}
 
@@ -220,6 +271,7 @@ async def generate_prediction(request: ForecastRequest) -> ForecastResponse:
             df=df_context,
             n_predict=request.n_predict,
             alpha=request.alpha,
+            **request.model_params,
         )
     except HTTPException:
         raise

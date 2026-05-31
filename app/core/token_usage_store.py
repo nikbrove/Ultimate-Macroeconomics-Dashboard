@@ -69,7 +69,7 @@ def _sql_uri() -> str:
     return (
         f"postgresql+psycopg2://"
         f"{os.getenv('POSTGRES_USER')}:{os.getenv('POSTGRES_PASSWORD')}"
-        f"@{pg.get('host')}:{pg.get('port')}/{pg.get('database')}"
+        f"@{pg.get('host')}:{pg.get('port')}/{os.getenv('POSTGRES_DB')}"
     )
 
 

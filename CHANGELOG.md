@@ -4,6 +4,50 @@ All notable changes to **Ultimate Macroeconomics Dashboard** are documented in t
 
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v0.10]
+
+Forecasting expansion (four new models + per-model hyperparameter inputs), forecast-chart polish (dashed history→forecast connector + optional point markers), tighter and cheaper LLM plot descriptions, two embedding-visualisation panels on the News page that ride on the existing clustering service, a `selected_marker` semantic theme token, and a `POSTGRES_DB`-resolution fix that finally lets the env var pick the database name everywhere instead of only at first volume init.
+
+### Added — forecasting
+
+- **Four new models in `forecaster`** alongside the existing `prophet` / `chronos`:
+  - `arima` — manual `(p, d, q)` via `statsmodels.tsa.arima.model.ARIMA`. The previous auto-tuned `pmdarima.auto_arima` wrapper has been renamed to **`auto_arima`** (the old `arima` model id is no longer accepted; switch saved presets accordingly).
+  - `sarima` — manual seasonal ARIMA via `statsmodels.tsa.statespace.SARIMAX` with stationarity/invertibility checks relaxed so user-supplied orders outside the strict region still produce a forecast.
+  - `moving_average` — naive flat-mean baseline; CI from in-sample residual sd × √horizon.
+  - `xgboost` — recursive XGBoost on lag + rolling-mean/std + time-index features; CI uses the same residual×√h heuristic as MA.
+- **`ForecastRequest.model_params`** — flat dict carrying per-model hyperparameters (`p`/`d`/`q`, `P`/`D`/`Q`/`s`, `window`, `lags`/`n_estimators`/`max_depth`/`learning_rate`). Wrappers `**kwargs` through what they need and ignore the rest, so callers can keep one shape regardless of model.
+- **GraphBox forecast popover** now exposes the model dropdown outside the form (so the per-model hyperparam widgets swap immediately on change) and gained a **Highlight points** toggle that flips every historical and forecast trace from `lines` to `lines+markers`. Off by default.
+- **Smoke tests** for every concrete forecaster in `forecaster/tests/test_arima_smoke.py` — same shape/CI bracketing assertion across `auto_arima`, manual `arima`, `sarima`, `moving_average`, and `xgboost` (with `pytest.importorskip("xgboost")` so the suite survives a missing wheel).
+
+### Added — news page embedding visualisations
+
+- **Embedding Map** (`_render_embedding_map`) — 2D/3D scatter of every article in the selected topic, projected via the clustering service (`POST /cluster`) with user-chosen reducer (`tsne` / `umap` / `pca`), clustering method (`kmeans` / `dbscan` / `hdbscan` / `hierarchical`), and `k`. The currently selected article is rendered as a star (2D) / diamond (3D) using the new `selected_marker` theme token; other points are coloured by cluster from `get_colorway()`. Capped at 1000 sampled points with a deterministic seed.
+- **Distance Histogram** (`_render_distance_histogram`) — cosine-distance distribution from the selected article to every other article in the topic, plus min / median / max metrics below the chart.
+- Both panels live behind an explicit `st.form_submit_button("Run …")` so nothing fires until the user asks; the result is cached in `st.session_state` keyed by collection so switching to a different article in the news selector only re-draws the highlight on the already-projected map (no re-clustering) and leaves the histogram as-is until the user reruns it.
+- **`core.qdrant_client.scroll_collection`** gained a `with_vectors: bool = False` argument used by the embedding panels' vector-load helper.
+
+### Added — theming
+
+- **`selected_marker`** semantic colour token in `_container_data/themes.yaml` for all three bundled themes (`dark`, `dark-blue`, `light-green`). Used by the News page embedding scatter to highlight the active article; pick a contrasting colour if you ship a custom theme.
+
+### Changed
+
+- **Forecast trace shape.** `build_line_plot` now draws a dashed segment from the last actual point to the first forecast point (no CI band on that segment) and keeps the existing dashed line + shaded CI starting at the first predicted point. The visual gap between history and forecast is gone; the band still only carries the model's uncertainty over the forecast window, not over the join. The connector and marker behaviour are unified across the grouped and ungrouped code paths.
+- **Plot interpretation prompts shortened.** `agent /plots/interpret` system prompts were rewritten to two short sentences (strict mode: "3 bullets, ~40 words"; creative mode: "max 60 words, mark hypotheses with 'likely'"), and the OpenAI call now caps `max_tokens` (200 / 260) so the model can't blow past the budget. Same endpoint, same modes, smaller and faster responses.
+- **`api_client.forecast_timeseries`** signature gained an optional `model_params: dict[str, Any] | None` argument that is forwarded to the forecaster service.
+
+### Fixed
+
+- **`POSTGRES_DB` env var was ignored by every Python client.** The postgres image creates the database named by `POSTGRES_DB` on first volume init, but `app/core/postgres_client.py`, `agent/main.py`, `downloader_extra/main.py`, and `downloader_general/main.py` all read the database name from `_container_data/config.yaml` (`postgres.database: postgres`, hardcoded). Setting `POSTGRES_DB=macroeconomics` therefore created the right database but every connection still pointed at `postgres`. Every call site now resolves `os.getenv("POSTGRES_DB") or config["postgres"]["database"]`. On existing deployments the volume already carries the originally-named database — either `docker compose down -v` and re-ingest, or `docker compose exec db createdb -U $POSTGRES_USER $POSTGRES_DB` and run the downloader against it.
+- **`forecaster/uv.lock` didn't contain `xgboost`.** The previous lockfile pre-dated the new dep, and the Dockerfile uses `uv sync --frozen`, so the container booted without xgboost and `forecasters/xgboost_model.py` failed at import time. The lockfile has been regenerated with `xgboost==2.1.4` pinned (numpy-2.x compatible, manylinux wheels). `cd forecaster && uv lock && docker compose build forecaster` is needed once.
+
+### Operator notes
+
+- Forecaster image rebuild required: `docker compose build forecaster && docker compose up -d forecaster`. The new XGBoost wheel adds ~80 MB to the image.
+- App image rebuild required for the News page additions: `docker compose build app && docker compose up -d app`.
+- `themes.yaml` carries a new key (`selected_marker`); existing custom themes need to add it or the News page embedding scatter will raise `KeyError`.
+- No `config.yaml` changes required; the existing `postgres.database` line stays as a fallback.
+
 ## [v0.9]
 
 AI-analyst quality and latency pass plus a critical fix to the read-only LLM Postgres role's permissions, on top of a broader maintenance pass: new `tests/` suites under every service (`agent`, `app`, `clustering`, `downloader_extra`, `downloader_general`, `forecaster`, `python_sandbox`), two new app pages (`17_token_usage`, `18_monitoring`) replacing the legacy `16_settings`, retirement of the standalone `_container_data/db_init.sh` (its job is now done by `downloader_general`'s bootstrap), and assorted refactors across every service. Same architecture, same overall UI; the multi-agent graph is shorter (one fewer LLM call per turn) and the supervisor / SQL / chat / RAG / web-search workers are now grounded in chat history, a centralised macro context block, and a deterministic worker-status channel.

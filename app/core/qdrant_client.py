@@ -85,6 +85,7 @@ def scroll_collection(
     collection_name: str,
     client: Optional[QdrantClient] = None,
     page_limit: int = 256,
+    with_vectors: bool = False,
 ) -> List[models.Record]:
     """Page through every point in a collection and return them in one list.
 
@@ -92,15 +93,19 @@ def scroll_collection(
         collection_name: Target Qdrant collection.
         client: Optional override (default: module-level client).
         page_limit: Number of records fetched per scroll page.
+        with_vectors: When ``True``, embeddings are returned alongside the
+            payloads (used by the embedding-visualisation panel; expensive
+            for large collections).
 
     Returns:
-        List of payload-carrying records (vectors stripped); empty on error.
+        List of payload-carrying records (vectors included when requested);
+        empty on error.
     """
     client = client or _DEFAULT_CLIENT
     log_vector_query(
         operation="scroll_collection",
         collection_name=collection_name,
-        summary=f"page_limit={page_limit}",
+        summary=f"page_limit={page_limit} with_vectors={with_vectors}",
     )
     all_records: List[models.Record] = []
     offset = None
@@ -112,7 +117,7 @@ def scroll_collection(
                 limit=page_limit,
                 offset=offset,
                 with_payload=True,
-                with_vectors=False,
+                with_vectors=with_vectors,
             )
             if not records:
                 break

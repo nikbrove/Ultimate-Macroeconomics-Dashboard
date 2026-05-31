@@ -69,6 +69,7 @@ dependencies = [
     "tzdata==2025.3",
     "urllib3==2.6.3",
     "uvicorn==0.41.0",
+    "xgboost==2.1.4",
 ]
 
 [build-system]

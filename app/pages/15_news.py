@@ -12,10 +12,14 @@ from threading import RLock
 from typing import Any
 
 import matplotlib.pyplot as plt
+import numpy as np
+import plotly.graph_objects as go
 import streamlit as st
 from wordcloud import WordCloud
 
+from core.api_client import cluster_dataframe
 from core.app_logging import log_page_render
+from core.plotting import apply_plotly_theme
 from core.qdrant_client import (
     find_nearest_embeddings,
     get_point,
@@ -23,7 +27,7 @@ from core.qdrant_client import (
     list_collections,
     scroll_collection,
 )
-from core.theming import get_color
+from core.theming import get_color, get_colorway
 
 PAGE_TITLE = "News Explorer"
 DEFAULT_NEAREST_COUNT = 5
@@ -315,6 +319,361 @@ def _show_selected_news(selected_item: dict[str, Any], show_metadata: bool) -> N
         )
 
 
+@st.cache_data(show_spinner=False, ttl=300)
+def _load_topic_vectors(collection_name: str, max_points: int) -> dict[str, Any]:
+    """Scroll the topic with vectors and return aligned id/title/vector lists.
+
+    Sampled down to ``max_points`` with a fixed seed so the embedding map
+    stays stable across reruns. Points without a recoverable vector are
+    dropped silently — see :func:`_extract_query_vector`.
+    """
+    records = scroll_collection(collection_name=collection_name, with_vectors=True)
+    ids: list[str] = []
+    titles: list[str] = []
+    vectors: list[list[float]] = []
+    for record in records:
+        vec = _extract_query_vector(getattr(record, "vector", None))
+        if not vec:
+            continue
+        payload = record.payload if isinstance(record.payload, dict) else {}
+        ids.append(str(record.id))
+        titles.append(_extract_title(payload, str(record.id)))
+        vectors.append(vec)
+
+    if max_points > 0 and len(ids) > max_points:
+        rng = np.random.default_rng(seed=42)
+        sample_idx = np.sort(rng.choice(len(ids), size=max_points, replace=False))
+        ids = [ids[i] for i in sample_idx]
+        titles = [titles[i] for i in sample_idx]
+        vectors = [vectors[i] for i in sample_idx]
+
+    return {"ids": ids, "titles": titles, "vectors": vectors}
+
+
+def _build_embedding_scatter(
+    plot_rows: list[dict[str, Any]],
+    viz_cols: list[str],
+    selected_id: str,
+    output_dim: int,
+) -> go.Figure:
+    """Render a 2D or 3D scatter coloured by cluster, with the selected article highlighted."""
+    palette = get_colorway()
+    by_cluster: dict[str, list[dict[str, Any]]] = {}
+    for row in plot_rows:
+        cluster_label = str(row.get("cluster", "unassigned"))
+        by_cluster.setdefault(cluster_label, []).append(row)
+
+    fig = go.Figure()
+    is_3d = output_dim == 3
+    x_col, y_col = viz_cols[0], viz_cols[1]
+    z_col = viz_cols[2] if is_3d and len(viz_cols) >= 3 else None
+
+    for idx, (cluster_label, cluster_rows) in enumerate(sorted(by_cluster.items())):
+        colour = palette[idx % len(palette)]
+        xs = [row[x_col] for row in cluster_rows]
+        ys = [row[y_col] for row in cluster_rows]
+        zs = [row[z_col] for row in cluster_rows] if z_col else None
+        titles = [str(row.get("__title", row.get("__article_id", ""))) for row in cluster_rows]
+        hovertemplate = "<b>%{text}</b><br>cluster=" + cluster_label + "<extra></extra>"
+        trace_kwargs: dict[str, Any] = {
+            "mode": "markers",
+            "name": f"cluster {cluster_label}",
+            "marker": dict(size=6, color=colour, opacity=0.85),
+            "text": titles,
+            "hovertemplate": hovertemplate,
+        }
+        if z_col:
+            fig.add_trace(go.Scatter3d(x=xs, y=ys, z=zs, **trace_kwargs))
+        else:
+            fig.add_trace(go.Scatter(x=xs, y=ys, **trace_kwargs))
+
+    selected_row = next(
+        (row for row in plot_rows if str(row.get("__article_id")) == selected_id),
+        None,
+    )
+    if selected_row is not None:
+        marker_kwargs: dict[str, Any] = dict(
+            size=14,
+            color=get_color("selected_marker"),
+            symbol="diamond" if z_col else "star",
+            line=dict(width=1, color="black"),
+        )
+        if z_col:
+            fig.add_trace(
+                go.Scatter3d(
+                    x=[selected_row[x_col]],
+                    y=[selected_row[y_col]],
+                    z=[selected_row[z_col]],
+                    mode="markers",
+                    name="selected",
+                    marker=marker_kwargs,
+                    text=[str(selected_row.get("__title", ""))],
+                    hovertemplate="<b>Selected: %{text}</b><extra></extra>",
+                )
+            )
+        else:
+            fig.add_trace(
+                go.Scatter(
+                    x=[selected_row[x_col]],
+                    y=[selected_row[y_col]],
+                    mode="markers",
+                    name="selected",
+                    marker=marker_kwargs,
+                    text=[str(selected_row.get("__title", ""))],
+                    hovertemplate="<b>Selected: %{text}</b><extra></extra>",
+                )
+            )
+
+    fig.update_layout(
+        margin=dict(l=0, r=0, t=10, b=0),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+    return apply_plotly_theme(fig)
+
+
+@st.fragment
+def _render_embedding_map(collection_name: str, selected_id: str) -> None:
+    """Render the topic-wide embedding scatter, projected via the clustering service.
+
+    Controls live inside an ``st.form`` so the projection only fires when the
+    "Run" submit button is pressed; the result is cached in session state and
+    only the selected-article highlight refreshes when the user picks a
+    different article elsewhere on the page.
+    """
+    with st.container(border=True):
+        st.markdown("### Embedding Map")
+        st.caption(
+            "2D/3D projection of every article in the topic, clustered and reduced "
+            "via the clustering service. The selected article is highlighted."
+        )
+
+        cache_key = f"emb_map_result_{collection_name}"
+
+        with st.form(key=f"emb_map_form_{collection_name}", border=False):
+            col_a, col_b, col_c, col_d = st.columns(4)
+            with col_a:
+                method = st.selectbox(
+                    "Cluster method",
+                    ["kmeans", "dbscan", "hdbscan", "hierarchical"],
+                    key=f"emb_map_method_{collection_name}",
+                )
+            with col_b:
+                reduction = st.selectbox(
+                    "Reducer",
+                    ["tsne", "umap", "pca"],
+                    key=f"emb_map_reducer_{collection_name}",
+                )
+            with col_c:
+                output_dim = st.selectbox(
+                    "Dim",
+                    [2, 3],
+                    key=f"emb_map_dim_{collection_name}",
+                )
+            with col_d:
+                max_points = st.slider(
+                    "Max points",
+                    min_value=50,
+                    max_value=1000,
+                    value=300,
+                    step=50,
+                    key=f"emb_map_max_{collection_name}",
+                )
+
+            k = st.slider(
+                "k (kmeans, ignored otherwise)",
+                min_value=2,
+                max_value=12,
+                value=4,
+                key=f"emb_map_k_{collection_name}",
+            )
+
+            run_clicked = st.form_submit_button(
+                "Run embedding map",
+                type="primary",
+                width="stretch",
+            )
+
+        if run_clicked:
+            bundle = _load_topic_vectors(collection_name, int(max_points))
+            ids = bundle["ids"]
+            if not ids:
+                st.info("No embeddings available for this topic.")
+                return
+            if len(ids) < 4:
+                st.info("Need at least 4 articles to project — try a richer topic.")
+                return
+
+            vectors = bundle["vectors"]
+            titles = bundle["titles"]
+            embedding_dim = len(vectors[0])
+            feature_cols = [f"f{i}" for i in range(embedding_dim)]
+            rows: list[dict[str, Any]] = []
+            for pid, title, vec in zip(ids, titles, vectors):
+                row: dict[str, Any] = {"__article_id": pid, "__title": title}
+                row.update({fc: float(v) for fc, v in zip(feature_cols, vec)})
+                rows.append(row)
+
+            with st.spinner("Projecting embeddings via the clustering service..."):
+                try:
+                    response = cluster_dataframe(
+                        dataframe=rows,
+                        method=method,
+                        feature_columns=feature_cols,
+                        k=int(k),
+                        reduction_method=reduction,
+                        output_dim=int(output_dim),
+                    )
+                except Exception as exc:
+                    st.warning(f"Clustering service is unavailable: {exc}")
+                    return
+
+            plot_rows = response.get("dataframe", [])
+            viz_cols = response.get("visualization_columns", [])
+            if not plot_rows or not viz_cols:
+                st.info("Clustering returned no projection.")
+                return
+
+            st.session_state[cache_key] = {
+                "plot_rows": plot_rows,
+                "viz_cols": viz_cols,
+                "output_dim": int(output_dim),
+            }
+
+        cached = st.session_state.get(cache_key)
+        if not cached:
+            st.info("Set the parameters above and press **Run embedding map** to compute.")
+            return
+
+        fig = _build_embedding_scatter(
+            plot_rows=cached["plot_rows"],
+            viz_cols=cached["viz_cols"],
+            selected_id=selected_id,
+            output_dim=int(cached["output_dim"]),
+        )
+        st.plotly_chart(
+            fig,
+            width="stretch",
+            key=f"emb_map_chart_{collection_name}",
+        )
+
+
+@st.fragment
+def _render_distance_histogram(collection_name: str, selected_id: str, selected_title: str) -> None:
+    """Plot the cosine-distance distribution from the selected article to every other in the topic.
+
+    Like :func:`_render_embedding_map`, the histogram only computes on Run. The
+    result is keyed by collection in session state and includes a label for the
+    article it was computed against so the user can see when their current
+    selection differs from the cached query.
+    """
+    with st.container(border=True):
+        st.markdown("### Distance from Selected Article")
+        st.caption(
+            "Cosine distance from the selected article to every other article in the topic. "
+            "Lower = more similar; the mass on the left indicates how many close neighbours exist."
+        )
+
+        cache_key = f"emb_hist_result_{collection_name}"
+
+        with st.form(key=f"emb_hist_form_{collection_name}", border=False):
+            max_points = st.slider(
+                "Sample size",
+                min_value=50,
+                max_value=1000,
+                value=300,
+                step=50,
+                key=f"emb_hist_max_{collection_name}",
+            )
+            run_clicked = st.form_submit_button(
+                "Run distance histogram",
+                type="primary",
+                width="stretch",
+            )
+
+        if run_clicked:
+            bundle = _load_topic_vectors(collection_name, int(max_points))
+            ids: list[str] = bundle["ids"]
+            vectors: list[list[float]] = bundle["vectors"]
+            if not ids:
+                st.info("No embeddings available for this topic.")
+                return
+
+            if selected_id in ids:
+                i = ids.index(selected_id)
+                query_vec: list[float] = vectors[i]
+                other_vectors: list[list[float]] = [v for j, v in enumerate(vectors) if j != i]
+            else:
+                point = get_point(
+                    collection_name=collection_name, point_id=selected_id, with_vector=True
+                )
+                if not point or not getattr(point, "vector", None):
+                    st.info("Selected article has no recoverable vector.")
+                    return
+                query_candidate = _extract_query_vector(point.vector)
+                if not query_candidate:
+                    st.info("Selected article vector is in an unsupported format.")
+                    return
+                query_vec = query_candidate
+                other_vectors = vectors
+
+            if not other_vectors:
+                st.info("Need at least 2 articles to compute a distance distribution.")
+                return
+
+            q = np.asarray(query_vec, dtype=float)
+            q_norm = q / (np.linalg.norm(q) + 1e-12)
+            v_matrix = np.asarray(other_vectors, dtype=float)
+            row_norms = np.linalg.norm(v_matrix, axis=1, keepdims=True) + 1e-12
+            v_normed = v_matrix / row_norms
+            sims = v_normed @ q_norm
+            distances = np.clip(1.0 - sims, 0.0, 2.0)
+
+            st.session_state[cache_key] = {
+                "distances": distances.tolist(),
+                "queried_id": selected_id,
+                "queried_title": selected_title,
+            }
+
+        cached = st.session_state.get(cache_key)
+        if not cached:
+            st.info("Press **Run distance histogram** to compute.")
+            return
+
+        distances_arr = np.asarray(cached["distances"], dtype=float)
+        queried_id = str(cached.get("queried_id") or "")
+        queried_title = str(cached.get("queried_title") or queried_id)
+        if queried_id != selected_id:
+            st.caption(
+                f"Showing distances for **{queried_title}** — press Run again to refresh "
+                "for the article you have now selected."
+            )
+
+        fig = go.Figure()
+        fig.add_trace(
+            go.Histogram(
+                x=distances_arr,
+                nbinsx=30,
+                marker=dict(color=get_colorway()[0]),
+                hovertemplate="distance: %{x:.3f}<br>count: %{y}<extra></extra>",
+            )
+        )
+        fig.update_layout(
+            xaxis_title="Cosine distance",
+            yaxis_title="Article count",
+            margin=dict(l=20, r=20, t=10, b=20),
+        )
+        st.plotly_chart(
+            apply_plotly_theme(fig),
+            width="stretch",
+            key=f"emb_hist_chart_{collection_name}",
+        )
+
+        col_min, col_med, col_max = st.columns(3)
+        col_min.metric("Min distance", f"{float(distances_arr.min()):.3f}")
+        col_med.metric("Median", f"{float(np.median(distances_arr)):.3f}")
+        col_max.metric("Max distance", f"{float(distances_arr.max()):.3f}")
+
+
 def _render_nearest_news(
     collection_name: str,
     selected_item: dict[str, Any],
@@ -434,6 +793,17 @@ def render_news_page() -> None:
         selected_item=selected_item,
         id_to_item=id_to_item,
         select_state_key=select_state_key,
+    )
+
+    st.divider()
+    _render_embedding_map(
+        collection_name=selected_topic,
+        selected_id=selected_news_id,
+    )
+    _render_distance_histogram(
+        collection_name=selected_topic,
+        selected_id=selected_news_id,
+        selected_title=str(selected_item.get("title", selected_news_id)),
     )
 
 

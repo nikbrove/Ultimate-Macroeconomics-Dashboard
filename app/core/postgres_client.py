@@ -27,10 +27,14 @@ CONFIG = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
 load_dotenv(ENV_FILE_PATH)
 
 _PG = CONFIG.get("postgres", {})
+# Database name source of truth is POSTGRES_DB in .env (the postgres image only
+# reads it from there on first volume init). config.yaml's `database` stays as
+# a fallback for environments that don't set the env var.
+_PG_DATABASE = os.getenv("POSTGRES_DB") or _PG.get("database")
 SQL_URL = (
     f"postgresql://"
     f"{os.getenv('POSTGRES_LLM_USER')}:{os.getenv('POSTGRES_LLM_PASSWORD')}"
-    f"@{_PG.get('host')}:{_PG.get('port')}/{_PG.get('database')}"
+    f"@{_PG.get('host')}:{_PG.get('port')}/{_PG_DATABASE}"
 )
 POSTGRES_TARGET = f"{_PG.get('host')}:{_PG.get('port')}"
 

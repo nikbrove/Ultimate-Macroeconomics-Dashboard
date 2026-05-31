@@ -18,6 +18,7 @@ class BaseForecaster(ABC):
         df: pl.DataFrame,
         n_predict: int,
         alpha: float,
+        **kwargs,
     ) -> pl.DataFrame:
         """Produce ``n_predict`` future points with a ``(1-alpha)`` confidence band.
 
@@ -26,6 +27,9 @@ class BaseForecaster(ABC):
                 already sorted ascending by ``ds``.
             n_predict: Number of future points to emit.
             alpha: Significance level for the confidence interval.
+            **kwargs: Model-specific hyperparameters (``p``/``d``/``q`` for
+                ARIMA, ``window`` for MA, ``lags`` for XGBoost, …). Forecasters
+                that don't need them ignore the dict.
 
         Returns:
             Polars frame with columns ``ds``, ``yhat``, ``yhat_lower``, ``yhat_upper``.

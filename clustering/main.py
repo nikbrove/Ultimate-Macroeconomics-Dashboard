@@ -1,20 +1,29 @@
 """FastAPI service exposing unsupervised clustering on tabular input.
 
-Wraps scikit-learn ``KMeans`` / ``DBSCAN`` and projects the feature matrix into
-2D for visualization. When the input has more than two features, the projection
-is built with t-SNE or PCA depending on the ``reduction_method`` field of the
-request; with one or two features the original space is preserved as-is.
+Wraps scikit-learn clustering algorithms (KMeans, DBSCAN, Mean-Shift, HDBSCAN,
+SpectralClustering, AgglomerativeClustering) and projects the feature matrix
+into 2D or 3D for visualisation. When ``n_features > output_dim`` the projection
+is built with t-SNE, PCA, UMAP, or Kernel PCA (per ``reduction_method``); with
+``n_features <= output_dim`` the original space is preserved as-is.
 """
 
 from pathlib import Path
 
 import numpy as np
+import umap
 import yaml
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
-from sklearn.cluster import DBSCAN, KMeans
-from sklearn.decomposition import PCA
+from sklearn.cluster import (
+    DBSCAN,
+    HDBSCAN,
+    AgglomerativeClustering,
+    KMeans,
+    MeanShift,
+    SpectralClustering,
+)
+from sklearn.decomposition import PCA, KernelPCA
 from sklearn.manifold import TSNE
 
 from schemas import ClusterRequest, ClusterResponse
@@ -27,10 +36,15 @@ load_dotenv(ENV_FILE_PATH)
 
 VIZ_X_COL = "__viz_x"
 VIZ_Y_COL = "__viz_y"
+VIZ_Z_COL = "__viz_z"
+VIZ_COLS = (VIZ_X_COL, VIZ_Y_COL, VIZ_Z_COL)
 
 app = FastAPI(
     title="Clustering API",
-    description="A lightweight API for kmeans and dbscan clustering.",
+    description=(
+        "Tabular clustering (KMeans, DBSCAN, Mean-Shift, HDBSCAN, Spectral, "
+        "Hierarchical) with 2D/3D projection (t-SNE, PCA, UMAP, Kernel PCA)."
+    ),
 )
 
 
@@ -101,69 +115,107 @@ def _build_feature_matrix(
     return np.asarray(matrix, dtype=float), feature_columns
 
 
+def _passthrough_projection(
+    feature_matrix: np.ndarray, feature_columns: list[str], output_dim: int
+) -> tuple[np.ndarray, str, list[str]]:
+    """Return the feature matrix as the visual projection without reduction.
+
+    Pads the right-hand columns with a zero axis when there are strictly fewer
+    features than ``output_dim`` (so the caller always gets an ``output_dim``-wide
+    matrix), and truncates to the first ``output_dim`` columns when there are
+    more features than asked for (used by the small-sample fallback).
+    """
+    n_rows, n_features = feature_matrix.shape
+
+    if n_features >= output_dim:
+        projection = feature_matrix[:, :output_dim]
+        labels = list(feature_columns[:output_dim])
+        return projection, "feature_space", labels
+
+    pad_width = output_dim - n_features
+    zero_block = np.zeros((n_rows, pad_width), dtype=float)
+    projection = np.hstack([feature_matrix, zero_block])
+    labels = list(feature_columns) + ["Zero axis"] * pad_width
+    return projection, "feature_space", labels
+
+
 def _build_visual_projection(
     feature_matrix: np.ndarray,
     feature_columns: list[str],
     random_state: int,
-    reduction_method: str = "tsne",
+    reduction_method: str,
+    output_dim: int,
+    umap_n_neighbors: int,
+    umap_min_dist: float,
+    kpca_kernel: str,
+    kpca_gamma: float | None,
+    kpca_degree: int,
+    kpca_coef0: float,
 ) -> tuple[np.ndarray, str, list[str]]:
-    """Project ``feature_matrix`` into 2D for plotting.
+    """Project ``feature_matrix`` into ``output_dim`` dimensions for plotting.
 
-    The branch taken depends on shape: one feature is padded with a zero
-    axis, two features are returned as-is, otherwise a dim-reduction is
-    applied (PCA or t-SNE per ``reduction_method``). Fewer than 5 rows skip
-    the reduction entirely because t-SNE needs perplexity ``< n_rows``.
-
-    Args:
-        feature_matrix: ``(n_rows, n_features)`` numeric matrix.
-        feature_columns: Names of the columns in ``feature_matrix``.
-        random_state: Seed forwarded to PCA / TSNE for determinism.
-        reduction_method: ``"tsne"`` or ``"pca"``; only consulted when
-            ``n_features > 2`` and ``n_rows >= 5``.
+    Branching:
+      * ``n_features <= output_dim`` — pass-through (pad with a zero axis if
+        strictly fewer features).
+      * ``n_rows < 5`` — pass-through with the first ``output_dim`` feature
+        columns (avoids degenerate TSNE perplexity / UMAP neighbours).
+      * Otherwise dispatch on ``reduction_method``.
 
     Returns:
-        Tuple of ``(projection, mode, axis_labels)`` where ``mode`` is one
-        of ``"feature_space"``, ``"tsne"``, ``"pca"`` for downstream UIs.
+        Tuple of ``(projection, mode, axis_labels)`` where ``mode`` is one of
+        ``"feature_space"``, ``"tsne"``, ``"pca"``, ``"umap"``, ``"kpca"``.
+        ``axis_labels`` has length ``output_dim``.
     """
     n_rows, n_features = feature_matrix.shape
 
-    if n_features == 1:
-        zero_col = np.zeros((n_rows, 1), dtype=float)
-        return (
-            np.hstack([feature_matrix, zero_col]),
-            "feature_space",
-            [
-                feature_columns[0],
-                "Zero axis",
-            ],
-        )
-
-    if n_features == 2:
-        return feature_matrix, "feature_space", [feature_columns[0], feature_columns[1]]
+    if reduction_method == "none" or n_features <= output_dim:
+        return _passthrough_projection(feature_matrix, feature_columns, output_dim)
 
     if n_rows < 5:
-        return (
-            feature_matrix[:, :2],
-            "feature_space",
-            [
-                feature_columns[0],
-                feature_columns[1],
-            ],
-        )
+        return _passthrough_projection(feature_matrix, feature_columns, output_dim)
 
     if reduction_method == "pca":
-        projection = PCA(n_components=2, random_state=random_state).fit_transform(feature_matrix)
-        return projection, "pca", ["PC 1", "PC 2"]
+        projection = PCA(n_components=output_dim, random_state=random_state).fit_transform(
+            feature_matrix
+        )
+        labels = [f"PC {i + 1}" for i in range(output_dim)]
+        return projection, "pca", labels
 
+    if reduction_method == "umap":
+        effective_neighbors = max(2, min(umap_n_neighbors, n_rows - 1))
+        reducer = umap.UMAP(
+            n_components=output_dim,
+            n_neighbors=effective_neighbors,
+            min_dist=umap_min_dist,
+            random_state=random_state,
+        )
+        projection = reducer.fit_transform(feature_matrix)
+        labels = [f"UMAP {i + 1}" for i in range(output_dim)]
+        return projection, "umap", labels
+
+    if reduction_method == "kpca":
+        projection = KernelPCA(
+            n_components=output_dim,
+            kernel=kpca_kernel,
+            gamma=kpca_gamma,
+            degree=kpca_degree,
+            coef0=kpca_coef0,
+            random_state=random_state,
+        ).fit_transform(feature_matrix)
+        labels = [f"KPC {i + 1}" for i in range(output_dim)]
+        return projection, "kpca", labels
+
+    # default: t-SNE
     perplexity = min(30.0, float(n_rows - 1))
     projection = TSNE(
-        n_components=2,
+        n_components=output_dim,
         random_state=random_state,
         init="random",
         learning_rate="auto",
         perplexity=perplexity,
     ).fit_transform(feature_matrix)
-    return projection, "tsne", ["t-SNE 1", "t-SNE 2"]
+    labels = [f"t-SNE {i + 1}" for i in range(output_dim)]
+    return projection, "tsne", labels
 
 
 @app.get("/")
@@ -182,9 +234,93 @@ def health_check() -> dict[str, str]:
 def list_methods() -> dict[str, list[str]]:
     """Expose the algorithms and dim-reduction methods supported by this service."""
     return {
-        "available_methods": ["kmeans", "dbscan"],
-        "available_reductions": ["tsne", "pca"],
+        "available_methods": [
+            "kmeans",
+            "dbscan",
+            "meanshift",
+            "hdbscan",
+            "spectral",
+            "hierarchical",
+        ],
+        "available_reductions": ["tsne", "pca", "umap", "kpca"],
     }
+
+
+def _build_estimator(request: ClusterRequest, n_rows: int) -> object:
+    """Construct the sklearn estimator selected by ``request.method``.
+
+    Args:
+        request: Parsed and validated ``ClusterRequest``.
+        n_rows: Number of input rows; used for cluster-count sanity checks.
+
+    Returns:
+        A scikit-learn estimator implementing ``fit_predict``.
+
+    Raises:
+        HTTPException: 400 for unknown algorithms or impossible cluster counts.
+    """
+    method = request.method
+    if method == "kmeans":
+        if request.k > n_rows:
+            raise HTTPException(
+                status_code=400,
+                detail=f"k ({request.k}) cannot be greater than the number of rows ({n_rows}).",
+            )
+        return KMeans(
+            n_clusters=request.k,
+            n_init=request.n_init,
+            random_state=request.random_state,
+        )
+
+    if method == "dbscan":
+        return DBSCAN(eps=request.eps, min_samples=request.min_samples)
+
+    if method == "meanshift":
+        return MeanShift(bandwidth=request.bandwidth)
+
+    if method == "hdbscan":
+        return HDBSCAN(
+            min_cluster_size=request.hdbscan_min_cluster_size,
+            min_samples=request.hdbscan_min_samples,
+        )
+
+    if method == "spectral":
+        if request.spectral_n_clusters > n_rows:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"spectral_n_clusters ({request.spectral_n_clusters}) cannot be greater "
+                    f"than the number of rows ({n_rows})."
+                ),
+            )
+        kwargs: dict[str, object] = {
+            "n_clusters": request.spectral_n_clusters,
+            "affinity": request.spectral_affinity,
+            "random_state": request.random_state,
+            "assign_labels": "kmeans",
+        }
+        if request.spectral_affinity == "rbf":
+            kwargs["gamma"] = request.spectral_gamma
+        else:
+            # n_neighbors must be < n_samples for nearest_neighbors affinity.
+            kwargs["n_neighbors"] = max(2, min(request.spectral_n_neighbors, n_rows - 1))
+        return SpectralClustering(**kwargs)
+
+    if method == "hierarchical":
+        if request.hierarchical_n_clusters > n_rows:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"hierarchical_n_clusters ({request.hierarchical_n_clusters}) cannot be "
+                    f"greater than the number of rows ({n_rows})."
+                ),
+            )
+        return AgglomerativeClustering(
+            n_clusters=request.hierarchical_n_clusters,
+            linkage=request.hierarchical_linkage,
+        )
+
+    raise HTTPException(status_code=400, detail=f"Unknown method: {method}")
 
 
 def _run_clustering(
@@ -193,16 +329,15 @@ def _run_clustering(
     feature_columns: list[str],
     random_state: int,
     reduction_method: str,
+    output_dim: int,
+    umap_n_neighbors: int,
+    umap_min_dist: float,
+    kpca_kernel: str,
+    kpca_gamma: float | None,
+    kpca_degree: int,
+    kpca_coef0: float,
 ) -> tuple[np.ndarray, np.ndarray, str, list[str]]:
-    """Fit ``estimator`` on ``feature_matrix`` and build the 2D projection.
-
-    Args:
-        estimator: A scikit-learn estimator implementing ``fit_predict``.
-        feature_matrix: Numeric input passed straight to the estimator.
-        feature_columns: Original column names (used for axis labels).
-        random_state: Seed for the projection step.
-        reduction_method: ``"tsne"`` or ``"pca"`` — see
-            :func:`_build_visual_projection`.
+    """Fit ``estimator`` on ``feature_matrix`` and build the visual projection.
 
     Returns:
         Tuple of ``(labels, projection, projection_mode, projection_labels)``.
@@ -213,21 +348,30 @@ def _run_clustering(
         feature_columns=feature_columns,
         random_state=random_state,
         reduction_method=reduction_method,
+        output_dim=output_dim,
+        umap_n_neighbors=umap_n_neighbors,
+        umap_min_dist=umap_min_dist,
+        kpca_kernel=kpca_kernel,
+        kpca_gamma=kpca_gamma,
+        kpca_degree=kpca_degree,
+        kpca_coef0=kpca_coef0,
     )
     return labels, projection, projection_mode, projection_labels
 
 
 @app.post("/cluster", response_model=ClusterResponse)
 async def cluster_dataframe(request: ClusterRequest) -> ClusterResponse:
-    """Cluster the rows in ``request`` and return labels + 2D coordinates.
+    """Cluster the rows in ``request`` and return labels + projection coordinates.
 
     Args:
-        request: Payload selecting the algorithm, hyperparameters, and the
-            input rows. See :class:`schemas.ClusterRequest`.
+        request: Payload selecting the algorithm, hyperparameters, projection
+            method, and target output dimensionality. See
+            :class:`schemas.ClusterRequest`.
 
     Returns:
-        ClusterResponse with the original rows augmented with ``cluster`` /
-        ``__viz_x`` / ``__viz_y`` plus projection metadata.
+        ClusterResponse with the original rows augmented with ``cluster`` plus
+        ``__viz_x`` / ``__viz_y`` (and ``__viz_z`` when ``output_dim == 3``)
+        and projection metadata.
 
     Raises:
         HTTPException: 400 for unknown algorithms or bad inputs; 500 for
@@ -235,27 +379,8 @@ async def cluster_dataframe(request: ClusterRequest) -> ClusterResponse:
     """
     rows = request.dataframe
     feature_matrix, feature_columns = _build_feature_matrix(rows, request.feature_columns)
-
-    if request.method == "kmeans":
-        if request.k > len(rows):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"k ({request.k}) cannot be greater than the number of rows ({len(rows)})."
-                ),
-            )
-        estimator = KMeans(
-            n_clusters=request.k,
-            n_init=request.n_init,
-            random_state=request.random_state,
-        )
-    elif request.method == "dbscan":
-        estimator = DBSCAN(
-            eps=request.eps,
-            min_samples=request.min_samples,
-        )
-    else:
-        raise HTTPException(status_code=400, detail=f"Unknown method: {request.method}")
+    estimator = _build_estimator(request, n_rows=len(rows))
+    output_dim = int(request.output_dim)
 
     try:
         labels, projection, projection_mode, projection_labels = await run_in_threadpool(
@@ -265,6 +390,13 @@ async def cluster_dataframe(request: ClusterRequest) -> ClusterResponse:
             feature_columns,
             request.random_state,
             request.reduction_method,
+            output_dim,
+            request.umap_n_neighbors,
+            request.umap_min_dist,
+            request.kpca_kernel,
+            request.kpca_gamma,
+            request.kpca_degree,
+            request.kpca_coef0,
         )
     except ValueError as e:
         raise HTTPException(
@@ -274,16 +406,17 @@ async def cluster_dataframe(request: ClusterRequest) -> ClusterResponse:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Clustering failed: {str(e)}")
 
+    viz_columns = list(VIZ_COLS[:output_dim])
     output_rows = [dict(row) for row in rows]
     for row, label, point in zip(output_rows, labels, projection):
         row["cluster"] = int(label)
-        row[VIZ_X_COL] = float(point[0])
-        row[VIZ_Y_COL] = float(point[1])
+        for col, value in zip(viz_columns, point):
+            row[col] = float(value)
 
     return ClusterResponse(
         method_used=request.method,
         dataframe=output_rows,
         visualization_mode=projection_mode,
-        visualization_columns=[VIZ_X_COL, VIZ_Y_COL],
+        visualization_columns=viz_columns,
         visualization_labels=projection_labels,
     )

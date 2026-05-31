@@ -107,7 +107,10 @@ def main() -> None:
     env_file = _require(args, "shared", "env_file")
     postgres_host = _require(args, "postgres", "host")
     postgres_port = _require(args, "postgres", "port")
-    postgres_db = _require(args, "postgres", "database")
+    # config.yaml holds the fallback DB name; POSTGRES_DB in .env wins because
+    # that's the value the postgres image uses on first volume init.
+    load_dotenv(env_file)
+    postgres_db = os.getenv("POSTGRES_DB") or _require(args, "postgres", "database")
     qdrant_host = _require(args, "qdrant", "host")
     qdrant_port = _require(args, "qdrant", "port")
     database_schema_path = _require(args, "shared", "database_schema")
@@ -123,7 +126,6 @@ def main() -> None:
     )
     openai_model_dimensions = _require(args, "shared", "openai_embedding_model_dimensions")
 
-    load_dotenv(env_file)
     superuser_uri = _get_sql_config(
         username=os.getenv("POSTGRES_USER", ""),
         password=os.getenv("POSTGRES_PASSWORD", ""),
