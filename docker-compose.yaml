@@ -16,7 +16,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      test: [ "CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}" ]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -33,7 +33,7 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
     healthcheck:
-      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      test: [ "CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1" ]
       interval: 30s
       timeout: 5s
       retries: 10
@@ -84,7 +84,7 @@ services:
       - ./_container_data/_configs:/app/_configs:ro
       - ./_container_data/agent:/app/_container_data
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status == 200 else 1)"]
+      test: [ "CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status == 200 else 1)" ]
       interval: 30s
       timeout: 5s
       retries: 10
@@ -111,19 +111,21 @@ services:
       - ./_container_data/config.yaml:/app/config.yaml:ro
       - ./_container_data/forecaster:/app/_container_data
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8001/health', timeout=3).status == 200 else 1)"]
+      test: [ "CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8001/health', timeout=3).status == 200 else 1)" ]
       interval: 30s
       timeout: 5s
       retries: 10
       start_period: 60s
     # remove `deploy` part if no GPU available
+    ### start of removable part
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
               count: all
-              capabilities: [gpu]
+              capabilities: [ gpu ]
+    ### end of removable part
 
   clustering:
     build:
@@ -146,7 +148,7 @@ services:
       - ./_container_data/config.yaml:/app/config.yaml:ro
       - ./_container_data/clustering:/app/_container_data
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8002/health', timeout=3).status == 200 else 1)"]
+      test: [ "CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8002/health', timeout=3).status == 200 else 1)" ]
       interval: 30s
       timeout: 5s
       retries: 10
@@ -173,7 +175,7 @@ services:
       - ./_container_data/config.yaml:/app/config.yaml:ro
       - ./_container_data/downloader_extra:/app/_container_data
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8003/health', timeout=3).status == 200 else 1)"]
+      test: [ "CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8003/health', timeout=3).status == 200 else 1)" ]
       interval: 30s
       timeout: 5s
       retries: 10
@@ -200,7 +202,7 @@ services:
       - ./_container_data/config.yaml:/app/config.yaml:ro
       - ./_container_data/python_sandbox:/app/_container_data
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8004/health', timeout=3).status == 200 else 1)"]
+      test: [ "CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8004/health', timeout=3).status == 200 else 1)" ]
       interval: 30s
       timeout: 5s
       retries: 10
@@ -244,7 +246,7 @@ services:
       # to introspect the host's containers.
       - /var/run/docker.sock:/var/run/docker.sock:ro
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8501/_stcore/health', timeout=3).status == 200 else 1)"]
+      test: [ "CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8501/_stcore/health', timeout=3).status == 200 else 1)" ]
       interval: 30s
       timeout: 5s
       retries: 10
