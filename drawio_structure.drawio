@@ -1,10 +1,10 @@
 <mxfile host="65bd71144e">
-    <diagram name="IT_Structure_Classic" id="E6kbDoRg4YTXhb1ni7zy">
-        <mxGraphModel dx="2790" dy="2226" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" background="#1a1a2e" math="0" shadow="0">
+    <diagram name="Structure" id="E6kbDoRg4YTXhb1ni7zy">
+        <mxGraphModel dx="2315" dy="1298" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" background="#1a1a2e" math="0" shadow="0">
             <root>
                 <mxCell id="0"/>
                 <mxCell id="1" parent="0"/>
-                <mxCell id="2" value="" style="group" vertex="1" connectable="0" parent="1">
+                <mxCell id="2" value="" style="group" parent="1" vertex="1" connectable="0">
                     <mxGeometry x="-500" y="40" width="1320" height="1010" as="geometry"/>
                 </mxCell>
                 <mxCell id="node-dashboard" value="Dashboard" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1565c0;strokeColor=#ffffff;fontColor=#ffffff;fontSize=16;fontStyle=1;strokeWidth=3;" parent="2" vertex="1">
@@ -41,10 +41,7 @@
                     <mxGeometry x="990" y="651.6129032258063" width="330" height="358.38709677419354" as="geometry"/>
                 </mxCell>
                 <mxCell id="node-downloader-gen" value="downloader_general" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#2d5986;strokeColor=#ffffff;fontColor=#ffffff;fontSize=12;fontStyle=1;strokeWidth=2;" parent="container-datafetch" vertex="1">
-                    <mxGeometry x="33" y="81.45161290322581" width="264" height="89.59677419354838" as="geometry"/>
-                </mxCell>
-                <mxCell id="node-db-init" value="db_init" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#2d5986;strokeColor=#ffffff;fontColor=#ffffff;fontSize=12;fontStyle=1;strokeWidth=2;" parent="container-datafetch" vertex="1">
-                    <mxGeometry x="33" y="203.62903225806457" width="264" height="89.59677419354838" as="geometry"/>
+                    <mxGeometry x="33" y="134.4" width="264" height="89.59677419354838" as="geometry"/>
                 </mxCell>
                 <mxCell id="edge-datafetch-storage" value="" style="endArrow=block;endFill=1;html=1;rounded=0;strokeColor=#ffffff;strokeWidth=2;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;" parent="2" source="container-datafetch" target="container-storage" edge="1">
                     <mxGeometry relative="1" as="geometry"/>
