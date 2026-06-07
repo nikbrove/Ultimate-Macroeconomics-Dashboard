@@ -1,59 +1,145 @@
+"""Streamlit entry point: page config, navigation, and one-time bootstrap.
+
+Streamlit re-executes this module from top to bottom on every interaction,
+so all expensive work lives behind ``st.cache_*`` decorators in
+``core/``. This file only sets the page config, registers the Plotly
+template, initialises ``st.session_state``, defines the multi-page nav,
+and shows the data disclaimer dialog on first visit.
+"""
+
 import streamlit as st
-import pandas as pd
-import plotly.express as px
-from fredapi import Fred
 
-# Configurazione Pagina
-st.set_page_config(page_title="Ultimate Macro Dashboard", layout="wide")
+from core.theming import register_plotly_template
 
-# Recupero Chiave API dai Secrets (Metodo Standard Streamlit)
-try:
-    # Cerchiamo la chiave sia in minuscolo che in maiuscolo per sicurezza
-    if "fred_api_key" in st.secrets:
-        key = st.secrets["fred_api_key"]
-    elif "FRED_API_KEY" in st.secrets:
-        key = st.secrets["FRED_API_KEY"]
-    else:
-        st.error("Chiave API 'fred_api_key' non trovata nei Secrets!")
-        st.stop()
-    
-    fred = Fred(api_key=key)
-except Exception as e:
-    st.error(f"Errore inizializzazione FRED: {e}")
-    st.stop()
+st.set_page_config(
+    page_title="Ultimate Macroeconomics Dashboard",
+    page_icon="🌍",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-st.title("🏛️ Ultimate Macroeconomics Dashboard")
-st.markdown("Dati reali in tempo reale dai server FRED (Federal Reserve)")
+st.logo("assets/logo.png")
 
-# Sidebar per selezione
-country_map = {"USA": "USA", "Eurozona": "Euro Area", "Giappone": "JPN", "UK": "GBR"}
-target_country = st.sidebar.selectbox("Seleziona Area Geografica", list(country_map.keys()))
+register_plotly_template()
 
-# Indicatori Macro Core (Codici FRED REALI)
-metrics = {
-    "PIL (GDP)": "GDP" if target_country == "USA" else "CPMNACSCAB1GQEL",
-    "Inflazione (CPI)": "CPIAUCSL" if target_country == "USA" else "CPALTT01EZM657N",
-    "Tasso Disoccupazione": "UNRATE" if target_country == "USA" else "LRHUTTTTEZM156S",
-    "Tassi Interesse": "FEDFUNDS" if target_country == "USA" else "ECBASWIND"
-}
 
-selected_metric = st.sidebar.radio("Scegli Indicatore", list(metrics.keys()))
+def init_global_state():
+    """Initialise the cross-page session-state entries the first time the app loads.
 
-# Recupero Dati Live
-with st.spinner('Scaricamento dati da FRED in corso...'):
-    try:
-        series_id = metrics[selected_metric]
-        data = fred.get_series(series_id)
-        df = pd.DataFrame(data, columns=["Valore"])
-        df.index.name = "Data"
-        
-        # Grafico Plotly
-        fig = px.line(df, y="Valore", title=f"{selected_metric} - {target_country}", 
-                     template="plotly_dark", color_discrete_sequence=['#00d1ff'])
-        st.plotly_chart(fig, use_container_width=True)
-        
-        st.subheader("Ultimi rilascio dati:")
-        st.write(df.tail(10))
-        
-    except Exception as e:
-        st.error(f"Errore nel caricamento della serie {selected_metric}: {e}")
+    Streamlit clears ``session_state`` only on browser disconnect, so this
+    runs once per user session. Holds the chat history and the per-service
+    health flags consumed by the Monitoring page.
+    """
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+
+    if "api_health" not in st.session_state:
+        st.session_state.api_health = {
+            "db": True,
+            "vector_db": True,
+            "agent": True,
+            "clustering": True,
+            "python_sandbox": True,
+            "forecaster": True,
+            "downloader_extra": True,
+        }
+
+
+def setup_routing():
+    """Declare every ``st.Page`` and group them into the sidebar navigation.
+
+    Page-file order (``01_…`` through ``18_…``) drives the in-group order
+    while the dict keys define the section labels in the sidebar.
+
+    Returns:
+        The configured ``st.navigation`` object ready to ``.run()``.
+    """
+    p_basic_indicators = st.Page(
+        "pages/01_basic_indicators.py", title="General Economics Indicators", icon="📈"
+    )
+    p_economy_structure = st.Page(
+        "pages/02_economy_structure.py", title="Economy Structure", icon="📈"
+    )
+    p_finance_monetary = st.Page(
+        "pages/03_finance_monetary.py", title="Finance and Monetary", icon="📈"
+    )
+    p_trade = st.Page("pages/04_trade.py", title="Trade and External sector", icon="📈")
+    p_demography = st.Page("pages/05_demography.py", title="Demography", icon="📈")
+    p_governance = st.Page(
+        "pages/06_governance_institutions.py", title="Governance and Institutions", icon="📈"
+    )
+    p_tech_innovations = st.Page(
+        "pages/07_tech_innovation.py", title="Technology and Innovations", icon="📈"
+    )
+    p_health_wellbeing = st.Page(
+        "pages/08_health_wellbeing.py", title="Health and wellbeing", icon="📈"
+    )
+    p_education_human_capital = st.Page(
+        "pages/09_education_human_capital.py",
+        title="Education and Human Capital",
+        icon="📈",
+    )
+    p_environment = st.Page(
+        "pages/10_environment.py", title="Environment and Sustainability", icon="📈"
+    )
+    p_agent = st.Page("pages/11_ai_agent_chat.py", title="AI Analyst", icon="🤖")
+    p_custom_plot = st.Page(
+        "pages/12_custom_plot_builder.py", title="Custom Plot Constructor", icon="📊"
+    )
+    p_cluster = st.Page("pages/13_clustering_sandbox.py", title="Clustering Sandbox", icon="🔍")
+    p_yahoo_finance = st.Page("pages/14_yahoo_finance.py", title="Yahoo Finance", icon="💹")
+    p_news = st.Page("pages/15_news.py", title="News Explorer", icon="📰")
+    p_token_usage = st.Page("pages/17_token_usage.py", title="Token Usage", icon="🪙")
+    p_monitoring = st.Page("pages/18_monitoring.py", title="Monitoring", icon="🛰️")
+
+    pg = st.navigation(
+        {
+            "Dashboard": [
+                p_basic_indicators,
+                p_economy_structure,
+                p_finance_monetary,
+                p_trade,
+                p_demography,
+                p_governance,
+                p_tech_innovations,
+                p_health_wellbeing,
+                p_education_human_capital,
+                p_environment,
+            ],
+            "Other data": [p_yahoo_finance, p_news],
+            "Constructors": [p_custom_plot, p_cluster],
+            "AI": [p_agent],
+            "Settings": [p_token_usage, p_monitoring],
+        }
+    )
+
+    return pg
+
+
+def _show_data_disclaimer():
+    """Show the data-disclaimer dialog once per session and remember acceptance."""
+    if st.session_state.get("disclaimer_accepted"):
+        return
+
+    @st.dialog("Data Disclaimer", width="large")
+    def _disclaimer_dialog():
+        """Render the disclaimer dialog body; flip the session flag on accept."""
+        st.warning(
+            "**Important:** The developer of this dashboard is not responsible for "
+            "the accuracy, completeness, or quality of the data and news displayed. "
+            "All information is sourced from third-party providers and is presented "
+            "as-is. It is the user's responsibility to evaluate whether any given "
+            "source or data point is reliable before making decisions based on it."
+        )
+        if st.button("I understand", type="primary", width="stretch"):
+            st.session_state.disclaimer_accepted = True
+            st.rerun()
+
+    _disclaimer_dialog()
+
+
+init_global_state()
+_show_data_disclaimer()
+
+pg = setup_routing()
+pg.run()
