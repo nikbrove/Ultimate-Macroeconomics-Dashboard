@@ -1,0 +1,6 @@
+streamlit
+pandas
+plotly
+fredapi
+PyYAML
+scikit-learn
